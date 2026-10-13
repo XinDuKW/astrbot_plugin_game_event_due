@@ -25,9 +25,13 @@ from .services.message_formatter import (
     DEFAULT_COVER_MAX_TOTAL_MB,
     DEFAULT_COVER_MAX_WIDTH,
     DEFAULT_COVER_MODE,
+    DEFAULT_URGENCY_RULES,
     MessageSettings,
     build_overview_parts,
+    display_game_name,
     normalize_cover_mode,
+    normalize_game_aliases,
+    parse_urgency_rules,
 )
 from .services.polling_service import ActivityPollingService, PollingSettings
 from .services.reminder_service import ReminderPolicy, normalize_thresholds
@@ -42,6 +46,14 @@ from .sources import (
     JsonHttpClient,
     PrtsSource,
     SraSource,
+)
+from .services.urgent_dm_service import (
+    UrgentDmSettings,
+    is_ack_text,
+    normalize_ack_keywords,
+    normalize_games,
+    normalize_targets,
+    parse_quiet_hours,
 )
 from .sources.registry import GameRegistry
 
@@ -62,6 +74,15 @@ USAGE_THRESHOLD = (
     "用法: /活动阈值 <天数...>\n"
     "例如 /活动阈值 7 3 1 表示剩余不足 7 天 / 3 天 / 24 小时各提醒一次；\n"
     "/活动阈值 关闭 关闭倒计时提醒；/活动阈值 默认 恢复全局默认。"
+)
+USAGE_URGENT_DM = (
+    "用法:\n"
+    "/活动私人提醒 @某人       把某人加入紧急私聊提醒（管理员）\n"
+    "/活动私人提醒 移除 @某人  把某人移出紧急提醒（管理员）\n"
+    "/活动私人提醒 列表        查看当前的提醒目标\n"
+    "/活动私人提醒 停止        停止对自己的紧急提醒\n"
+    "/活动私人提醒 测试        给自己发一条测试私聊\n"
+    "被提醒的人回一句 /我已知晓 即可停止提醒；跟上活动名可以只停那一个。"
 )
 USAGE_FILTER = (
     "用法:\n"
@@ -183,6 +204,42 @@ class GameActivityPlugin(Star):
                 "activity_separator",
                 DEFAULT_ACTIVITY_SEPARATOR,
             ).strip("\r\n")[:MAX_SEPARATOR_LENGTH],
+            urgency_marker=self._cfg_bool(
+                "message_format", "urgency_marker", True
+            ),
+            urgency_rules=parse_urgency_rules(
+                self._cfg_str(
+                    "message_format", "urgency_rules", DEFAULT_URGENCY_RULES
+                )
+            ),
+            headline_remaining=self._cfg_bool(
+                "message_format", "headline_remaining", True
+            ),
+            tier_summary=self._cfg_bool("message_format", "tier_summary", True),
+            sort_by_urgency=self._cfg_bool(
+                "message_format", "sort_by_urgency", True
+            ),
+            game_aliases=normalize_game_aliases(
+                self._cfg("message_format", "game_aliases", "")
+            ),
+        )
+
+        # 紧急私聊提醒：进档后按间隔重复私聊，直到对方确认知晓
+        self.urgent_dm = UrgentDmSettings(
+            enabled=self._cfg_bool("urgent_dm", "enable", False),
+            targets=normalize_targets(self._cfg("urgent_dm", "targets", "")),
+            trigger_days=max(1, self._cfg_int("urgent_dm", "trigger_days", 1)),
+            repeat_minutes=max(
+                5, self._cfg_int("urgent_dm", "repeat_minutes", 120)
+            ),
+            daily_limit=max(0, self._cfg_int("urgent_dm", "daily_limit", 3)),
+            quiet_hours=parse_quiet_hours(
+                self._cfg_str("urgent_dm", "quiet_hours", "23-8")
+            ),
+            ack_keywords=normalize_ack_keywords(
+                self._cfg("urgent_dm", "ack_keywords", "")
+            ),
+            games=normalize_games(self._cfg("urgent_dm", "games", "")),
         )
 
         self.http_client = JsonHttpClient(
@@ -210,6 +267,7 @@ class GameActivityPlugin(Star):
             retention_days=max(
                 1, self._cfg_int("reminder", "state_retention_days", 30)
             ),
+            urgent_dm=self.urgent_dm,
         )
 
         self.subscriptions = SubscriptionService(
@@ -528,7 +586,11 @@ class GameActivityPlugin(Star):
                 source_name=self.registry.source_name(game.game_id),
             )
             yield event.chain_result(
-                await self.delivery.build_event_chain(parts, settings)
+                await self.delivery.build_event_chain(
+                    parts,
+                    settings,
+                    node_name=display_game_name(game, settings),
+                )
             )
 
     @filter.command("活动过滤", alias={"game_filter", "活动关键词"})
@@ -724,10 +786,228 @@ class GameActivityPlugin(Star):
             source_name = self.registry.source_name(items[0].game_id)
             lines.append(f"▎{source_name}")
             for game in items:
-                lines.append(f"• {game.name}（{game.game_id}）")
+                shown = display_game_name(game, self.message_settings)
+                aliases = "/".join(str(alias) for alias in game.aliases[:5])
+                suffix = f"，别名：{aliases}" if aliases else ""
+                lines.append(f"• {shown}（{game.game_id}{suffix}）")
             lines.append("")
         lines.append("用法: /活动订阅 <游戏名或代号>")
+        lines.append("想改成自己的叫法：插件配置 → 消息格式 → 自定义游戏显示名称")
         yield event.plain_result("\n".join(lines).rstrip())
+
+    @filter.command("活动私人提醒", alias={"game_dm", "活动私聊提醒"})
+    async def urgent_dm_command(self, event: AstrMessageEvent):
+        """管理紧急私聊提醒目标: /活动私人提醒 @某人 | 移除 @某人 | 列表 | 停止 | 测试。"""
+        umo = event.unified_msg_origin
+        self_umo = self._self_private_umo(event)
+        tokens = event.message_str.strip().split()[1:]
+        action = tokens[0].lower() if tokens else "列表"
+        is_admin = self._event_is_admin(event)
+        now = datetime.now(GAME_TIMEZONE)
+
+        if action in ("列表", "list", "查看"):
+            data = await self.subscriptions.get_urgent_dm()
+            lines: list[str] = []
+            for target, entry in data.items():
+                if not entry.get("enabled"):
+                    continue
+                if not is_admin and target != self_umo:
+                    continue
+                games = "、".join(entry.get("games") or []) or "跟随订阅"
+                pending = [
+                    str(state.get("name") or uid)
+                    for uid, state in (entry.get("activities") or {}).items()
+                    if not state.get("acked")
+                ]
+                detail = f"，正在提醒：{'、'.join(pending)}" if pending else ""
+                lines.append(f"· {target}（{games}）{detail}")
+            if not lines:
+                yield event.plain_result(
+                    "当前没有紧急私聊提醒目标。\n\n" + USAGE_URGENT_DM
+                )
+                return
+            yield event.plain_result("紧急私聊提醒目标:\n" + "\n".join(lines))
+            return
+
+        if action in ("停止", "退订", "stop"):
+            data = await self.subscriptions.get_urgent_dm()
+            acked = SubscriptionService.ack_urgent_activities(
+                data, self_umo, now, ()
+            )
+            removed = SubscriptionService.remove_urgent_target(data, self_umo)
+            if acked or removed:
+                await self.subscriptions.save_urgent_dm(data)
+                yield event.plain_result("✅ 已停止对你的紧急私聊提醒。")
+                return
+            yield event.plain_result("当前没有对你生效的紧急提醒。")
+            return
+
+        if action in ("测试", "test"):
+            # 测试消息必须落在执行者自己的私聊：群里执行也要私聊收到
+            ok = await self.delivery.send_text(
+                self_umo, "🔔 这是一条测试提醒：主动私聊可用。"
+            )
+            yield event.plain_result(
+                f"✅ 测试消息已发到你的私聊（{self_umo}），去私聊看看。"
+                if ok
+                else "❌ 测试消息发送失败，请确认适配器支持主动私聊。"
+            )
+            return
+
+        targets = self._mention_targets(event, umo)
+        if not targets and "FriendMessage" in umo:
+            targets = [umo]
+
+        if action in ("移除", "删除", "remove", "del"):
+            if not targets:
+                yield event.plain_result("请 @ 要移除的人。\n\n" + USAGE_URGENT_DM)
+                return
+            if not is_admin and any(target != umo for target in targets):
+                yield event.plain_result("只有管理员可以移除别人。")
+                return
+            data = await self.subscriptions.get_urgent_dm()
+            removed = [
+                target
+                for target in targets
+                if SubscriptionService.remove_urgent_target(data, target)
+            ]
+            if removed:
+                await self.subscriptions.save_urgent_dm(data)
+            yield event.plain_result(
+                f"✅ 已移出紧急提醒：{'、'.join(removed)}"
+                if removed
+                else "没有找到这些目标。"
+            )
+            return
+
+        if not targets:
+            yield event.plain_result(USAGE_URGENT_DM)
+            return
+        if not is_admin and any(target != umo for target in targets):
+            yield event.plain_result("只有管理员可以把别人加入紧急提醒。")
+            return
+
+        data = await self.subscriptions.get_urgent_dm()
+        for target in targets:
+            SubscriptionService.upsert_urgent_target(data, target, enabled=True)
+        await self.subscriptions.save_urgent_dm(data)
+        yield event.plain_result(
+            "✅ 已加入紧急私聊提醒：\n"
+            + "\n".join(f"· {target}" for target in targets)
+            + f"\n\n{USAGE_URGENT_DM}"
+        )
+
+    @filter.command("我已知晓", alias={"活动已知晓", "game_ack", "已知晓"})
+    async def ack_urgent_dm(self, event: AstrMessageEvent):
+        """确认已知晓: /我已知晓 [活动名关键词]，停止对自己的紧急提醒。"""
+        tokens = event.message_str.strip().split()[1:]
+        acked = await self._ack_now(self._self_private_umo(event), tokens)
+        if not acked:
+            yield event.plain_result("当前没有对你生效的紧急提醒。")
+            return
+        yield event.plain_result(self._ack_reply(acked))
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def ack_by_keyword(self, event: AstrMessageEvent):
+        """不带指令前缀的「我已知晓」同样能停止提醒（关键词可在配置里改）。"""
+        if not self.urgent_dm.enabled:
+            return
+        text = event.message_str.strip()
+        if not text or not is_ack_text(text, self.urgent_dm.ack_keywords):
+            return
+
+        acked = await self._ack_now(
+            self._self_private_umo(event), self._ack_scope(text)
+        )
+        if not acked:
+            return
+        event.stop_event()
+        yield event.plain_result(self._ack_reply(acked))
+
+    async def _ack_now(self, umo: str, scope: Sequence[str]) -> list[str]:
+        """确认知晓并落盘。
+
+        scope 为空表示全部确认；填了活动名关键词时优先只停命中的那些，一个都
+        没命中时退化成全部确认——用户写「我已知晓 xx」时不该被卡住。
+        """
+        data = await self.subscriptions.get_urgent_dm()
+        if not data.get(umo):
+            return []
+        now = datetime.now(GAME_TIMEZONE)
+        acked = SubscriptionService.ack_urgent_activities(data, umo, now, scope)
+        if not acked and scope:
+            acked = SubscriptionService.ack_urgent_activities(data, umo, now, ())
+        if acked:
+            await self.subscriptions.save_urgent_dm(data)
+        return acked
+
+    @staticmethod
+    def _ack_reply(acked: Sequence[str]) -> str:
+        names = "、".join(acked[:6])
+        extra = "" if len(acked) <= 6 else f" 等 {len(acked)} 个活动"
+        return f"✅ 已记下「已知晓」，这些活动不会再提醒你：{names}{extra}"
+
+    def _ack_scope(self, text: str) -> tuple[str, ...]:
+        """从确认语句里剥掉关键词，剩下的当作活动名过滤条件。"""
+        remaining = text
+        for keyword in self.urgent_dm.ack_keywords:
+            if keyword:
+                remaining = remaining.replace(keyword, " ")
+        tokens: list[str] = []
+        for chunk in remaining.replace("，", " ").replace(",", " ").split():
+            if chunk and chunk not in tokens:
+                tokens.append(chunk)
+        return tuple(tokens)
+
+    @staticmethod
+    def _self_private_umo(event: AstrMessageEvent) -> str:
+        """执行者自己的私聊会话。
+
+        紧急提醒的目标一律是「某个人的私聊」，所以在群里执行 /活动私人提醒 测试、
+        停止、/我已知晓（或直接说「我已知晓」）时，都必须落到**执行者本人**的私聊上，
+        而不是当前群——否则消息会发到群里，也永远匹配不到目标记录。
+        """
+        umo = event.unified_msg_origin
+        platform = umo.split(":", 1)[0] if ":" in umo else ""
+        sender = ""
+        getter = getattr(event, "get_sender_id", None)
+        if callable(getter):
+            try:
+                sender = str(getter() or "").strip()
+            except Exception:  # pragma: no cover - 取决于 AstrBot 版本
+                sender = ""
+        if platform and sender:
+            return f"{platform}:FriendMessage:{sender}"
+        return umo
+
+    @staticmethod
+    def _event_is_admin(event: AstrMessageEvent) -> bool:
+        checker = getattr(event, "is_admin", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:  # pragma: no cover - 取决于 AstrBot 版本
+                return False
+        return False
+
+    @staticmethod
+    def _mention_targets(event: AstrMessageEvent, umo: str) -> list[str]:
+        """把消息里 @ 到的 QQ 号拼成完整 UMO（主动私聊只能靠它定位）。"""
+        platform = umo.split(":", 1)[0] if ":" in umo else ""
+        if not platform:
+            return []
+        message_obj = getattr(event, "message_obj", None)
+        chain = getattr(message_obj, "message", None) or []
+        targets: list[str] = []
+        for component in chain:
+            qq = getattr(component, "qq", None)
+            if qq is None:
+                continue
+            text = str(qq).strip()
+            target = f"{platform}:FriendMessage:{text}"
+            if text and target not in targets:
+                targets.append(target)
+        return targets
 
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("活动状态", alias={"game_status"})

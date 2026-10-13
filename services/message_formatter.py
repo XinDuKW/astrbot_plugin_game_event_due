@@ -42,6 +42,136 @@ COVER_MODE_IMAGE = "image"
 COVER_MODES = (COVER_MODE_OFF, COVER_MODE_LINK, COVER_MODE_IMAGE)
 DEFAULT_COVER_MODE = COVER_MODE_IMAGE
 
+# ---- 剩余时间视觉标记 ----
+
+# 配置里可以直接写 emoji，也可以写颜色名，这里做一层映射
+URGENCY_MARKER_COLORS = {
+    "红": "🟥",
+    "red": "🟥",
+    "橙": "🟧",
+    "orange": "🟧",
+    "黄": "🟨",
+    "yellow": "🟨",
+    "绿": "🟩",
+    "green": "🟩",
+    "蓝": "🟦",
+    "blue": "🟦",
+    "紫": "🟪",
+    "purple": "🟪",
+    "黑": "⬛",
+    "black": "⬛",
+    "白": "⬜",
+    "white": "⬜",
+}
+
+DEFAULT_URGENCY_RULES = "1:🟥,3:🟧,7:🟩,*:🟦"
+
+
+@dataclass(frozen=True, slots=True)
+class UrgencyLevel:
+    """一个剩余时间档位对应的视觉标记。
+
+    ``max_days`` 是该档位的上界（天）；``0`` 表示兜底档，命中所有更宽松的剩余时间。
+    """
+
+    marker: str
+    max_days: float = 0.0
+
+    @property
+    def is_fallback(self) -> bool:
+        return self.max_days <= 0
+
+
+DEFAULT_URGENCY_LEVELS: tuple[UrgencyLevel, ...] = (
+    UrgencyLevel("🟥", 1),
+    UrgencyLevel("🟧", 3),
+    UrgencyLevel("🟩", 7),
+    UrgencyLevel("🟦", 0),
+)
+
+
+def parse_urgency_rules(value: object) -> tuple[UrgencyLevel, ...]:
+    """把 ``"1:🟥,3:🟧,7:🟩,*:🟦"`` 解析成按紧急度升序的档位表。
+
+    标记可以写成 emoji，也可以写颜色名（``1:红``）；天数写成 ``*`` 或 ``0``
+    表示兜底档。无法识别的项会被跳过；整体解析不出内容时回退到
+    ``DEFAULT_URGENCY_LEVELS``。
+    """
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return DEFAULT_URGENCY_LEVELS
+        items: list[object] = [
+            item for item in text.replace("，", ",").split(",") if item.strip()
+        ]
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return DEFAULT_URGENCY_LEVELS
+
+    levels: list[UrgencyLevel] = []
+    for item in items:
+        if isinstance(item, (list, tuple)) and len(item) == 2:
+            days_raw, marker_raw = item[0], item[1]
+        elif isinstance(item, str):
+            normalized = item.replace("：", ":")
+            if ":" not in normalized:
+                continue
+            days_raw, marker_raw = normalized.split(":", 1)
+        else:
+            continue
+
+        marker_text = str(marker_raw).strip()
+        marker = (
+            URGENCY_MARKER_COLORS.get(marker_text)
+            or URGENCY_MARKER_COLORS.get(marker_text.casefold())
+            or marker_text
+        )
+        if not marker:
+            continue
+
+        days_text = str(days_raw).strip()
+        if days_text in ("*", "0", "其他", "其它", "else", "default"):
+            days = 0.0
+        else:
+            try:
+                days = float(days_text)
+            except (TypeError, ValueError):
+                continue
+        levels.append(UrgencyLevel(marker, max(days, 0.0)))
+
+    if not levels:
+        return DEFAULT_URGENCY_LEVELS
+    levels.sort(key=lambda level: (level.is_fallback, level.max_days))
+    return tuple(levels)
+
+
+def urgency_level_for(
+    remaining: timedelta | None,
+    rules: Sequence[UrgencyLevel],
+) -> UrgencyLevel | None:
+    """返回剩余时间命中的最紧急档位；已结束或无法计算时返回 ``None``。"""
+    if remaining is None or remaining <= timedelta(0):
+        return None
+    for level in rules:
+        if level.is_fallback:
+            continue
+        if remaining <= timedelta(days=level.max_days):
+            return level
+    for level in rules:
+        if level.is_fallback:
+            return level
+    return None
+
+
+def activity_urgency_level(
+    activity: Activity,
+    now: datetime,
+    rules: Sequence[UrgencyLevel],
+) -> UrgencyLevel | None:
+    """活动当前的剩余时间档位。"""
+    return urgency_level_for(activity.remaining(now), rules)
+
 
 @dataclass(frozen=True, slots=True)
 class MessagePart:
@@ -69,6 +199,17 @@ class MessageSettings:
     cover_max_width: int = DEFAULT_COVER_MAX_WIDTH
     cover_max_total_mb: int = DEFAULT_COVER_MAX_TOTAL_MB
     activity_separator: str = DEFAULT_ACTIVITY_SEPARATOR
+    # 剩余时间标记（🟥 / 🟧 / 🟩 / 🟦）
+    urgency_marker: bool = True
+    urgency_rules: tuple[UrgencyLevel, ...] = DEFAULT_URGENCY_LEVELS
+    # 把剩余时间写进活动标题，消息顶部就能看到
+    headline_remaining: bool = True
+    # 消息标题里附上各档位数量，例如「🟥1 🟧2」
+    tier_summary: bool = True
+    # 把最紧急的活动排在前面
+    sort_by_urgency: bool = True
+    # 游戏显示名覆盖：(代号/原名/内置别名 -> 想显示的名字)
+    game_aliases: tuple[tuple[str, str], ...] = ()
 
     @property
     def cover_max_total_bytes(self) -> int:
@@ -97,6 +238,61 @@ def normalize_cover_mode(value: object) -> str:
     }
     text = legacy.get(text, text)
     return text if text in COVER_MODES else DEFAULT_COVER_MODE
+
+
+def normalize_game_aliases(value: object) -> tuple[tuple[str, str], ...]:
+    """解析「代号=显示名」的游戏别名，例如 sr=星铁 / arknights:舟游。
+
+    左边可以写游戏代号、完整名称或内置别名，右边是想显示的名字。
+    换行、逗号、分号都能分隔；解析不出来的项直接跳过。
+    """
+    if isinstance(value, (list, tuple)):
+        items = [str(item) for item in value]
+    else:
+        text = str(value or "")
+        normalized = (
+            text.replace("\r", "\n")
+            .replace("，", ",")
+            .replace("；", ",")
+            .replace(";", ",")
+        )
+        items = []
+        for line in normalized.split("\n"):
+            items.extend(line.split(","))
+
+    pairs: list[tuple[str, str]] = []
+    for item in items:
+        raw = str(item).strip()
+        if not raw:
+            continue
+        key = ""
+        name = ""
+        for separator in ("=", "：", ":", "＝"):
+            if separator in raw:
+                key, _, name = raw.partition(separator)
+                break
+        key = key.strip().casefold()
+        name = name.strip()
+        if not key or not name:
+            continue
+        if all(key != existing for existing, _ in pairs):
+            pairs.append((key, name))
+    return tuple(pairs)
+
+
+def display_game_name(game: Game, settings: MessageSettings) -> str:
+    """游戏在消息里的显示名：配置了别名就用别名，否则用原名。
+
+    匹配不区分大小写，代号、完整名、内置别名（崩铁 / 星铁 / 舟 等）都能命中。
+    """
+    if not settings.game_aliases:
+        return game.name
+    candidates = {game.game_id.casefold(), game.name.casefold()}
+    candidates.update(str(alias).casefold() for alias in game.aliases)
+    for key, alias in settings.game_aliases:
+        if key in candidates:
+            return alias
+    return game.name
 
 
 def truncate(text: str, limit: int) -> str:
@@ -131,14 +327,26 @@ def build_activity_block(
     封面按 ``settings.cover_mode`` 处理：``link`` 时写成文本行，``image`` 时作为
     独立的图片片段返回，``off`` 时完全不附带。
     """
+    marker = ""
+    if settings.urgency_marker:
+        level = activity_urgency_level(activity, now, settings.urgency_rules)
+        if level is not None:
+            marker = f"{level.marker} "
+
     labels = " · ".join(reason_label(reason) for reason in reasons)
-    headline = f"【{labels}】{activity.name}" if labels else activity.name
+    prefix = f"【{labels}】" if labels else ""
+    headline_suffix = ""
+    if settings.headline_remaining and include_remaining:
+        headline_suffix = _remaining_suffix(activity, now)
+    headline = f"{marker}{prefix}{activity.name}{headline_suffix}"
 
     lines = [headline]
     if activity.start_time is not None:
         lines.append(f"开始：{format_moment(activity.start_time, now)}")
     if activity.end_time is not None:
-        suffix = _remaining_suffix(activity, now) if include_remaining else ""
+        suffix = ""
+        if include_remaining and not settings.headline_remaining:
+            suffix = _remaining_suffix(activity, now)
         lines.append(f"结束：{format_moment(activity.end_time, now)}{suffix}")
 
     if settings.include_extra_times:
@@ -229,22 +437,72 @@ def parts_to_text(parts: Sequence[MessagePart]) -> str:
     return text
 
 
+def sort_plans_by_urgency(
+    plans: Sequence[ReminderPlan],
+    now: datetime,
+) -> list[ReminderPlan]:
+    """按剩余时间升序排列，让最紧急的活动排在最前面。"""
+
+    def sort_key(plan: ReminderPlan) -> tuple[int, float]:
+        # 只按剩余时间排序：稳定排序保证同一档位内维持原有顺序
+        remaining = plan.activity.remaining(now)
+        if remaining is None:
+            return (1, 0.0)
+        return (0, remaining.total_seconds())
+
+    return sorted(plans, key=sort_key)
+
+
+def summarize_markers(
+    activities: Sequence[Activity],
+    now: datetime,
+    settings: MessageSettings,
+) -> str:
+    """统计各剩余时间档位的活动数量，例如 ``🟥1 🟧2``。"""
+    if not (settings.urgency_marker and settings.tier_summary):
+        return ""
+
+    counts: dict[str, int] = {}
+    order: list[str] = []
+    for activity in activities:
+        level = activity_urgency_level(activity, now, settings.urgency_rules)
+        if level is None:
+            continue
+        if level.marker not in counts:
+            counts[level.marker] = 0
+            order.append(level.marker)
+        counts[level.marker] += 1
+
+    if not order:
+        return ""
+    return " ".join(f"{marker}{counts[marker]}" for marker in order)
+
+
 def build_reminder_parts(
     game: Game,
     plans: Sequence[ReminderPlan],
     now: datetime,
     settings: MessageSettings,
 ) -> list[MessagePart]:
-    """把一个游戏本轮的全部提醒合并为一条消息。"""
+    """把一个游戏本轮的全部提醒合并为一条消息。
+
+    开启 ``sort_by_urgency`` 时最紧急的活动排在最前，标题里附上各档位数量，
+    这样一眼就能看出这波提醒里有没有火烧眉毛的。
+    """
+    ordered = (
+        sort_plans_by_urgency(plans, now)
+        if settings.sort_by_urgency
+        else list(plans)
+    )
     blocks = [
         build_activity_block(plan.activity, plan.reasons, now, settings)
-        for plan in plans
+        for plan in ordered
     ]
-    return _assemble(
-        f"🎮 {game.name} · 活动提醒",
-        blocks,
-        settings.activity_separator,
-    )
+    header = f"🎮 {display_game_name(game, settings)} · 活动提醒"
+    summary = summarize_markers([plan.activity for plan in ordered], now, settings)
+    if summary:
+        header = f"{header}  {summary}"
+    return _assemble(header, blocks, settings.activity_separator)
 
 
 def build_single_reminder_parts(
@@ -255,7 +513,7 @@ def build_single_reminder_parts(
 ) -> list[MessagePart]:
     """只包含一个活动的提醒消息。"""
     return _assemble(
-        f"🎮 {game.name} · 活动提醒",
+        f"🎮 {display_game_name(game, settings)} · 活动提醒",
         [build_activity_block(plan.activity, plan.reasons, now, settings)],
         settings.activity_separator,
     )
@@ -314,7 +572,7 @@ def build_overview_parts(
         segments.append(f"（数据来源：{source_name}）")
 
     return _assemble(
-        f"🎮 {game.name} · 当前活动",
+        f"🎮 {display_game_name(game, settings)} · 当前活动",
         segments,
         settings.activity_separator,
     )
@@ -351,4 +609,40 @@ def build_overview_message(
 ) -> str:
     return parts_to_text(
         build_overview_parts(game, activities, now, settings, source_name=source_name)
+    )
+
+
+def build_urgent_dm_parts(
+    activities: Sequence[Activity],
+    now: datetime,
+    settings: MessageSettings,
+    *,
+    ack_hint: str = "",
+) -> list[MessagePart]:
+    """构建紧急私聊提醒的消息片段。
+
+    每个活动一个块（标题带剩余时间标记），结尾附一句「怎么停止提醒」的说明。
+    """
+    blocks: list[str | list[MessagePart]] = [
+        build_activity_block(activity, (), now, settings) for activity in activities
+    ]
+    if ack_hint:
+        blocks.append(ack_hint)
+
+    if len(activities) > 1:
+        header = f"🚨 {len(activities)} 个活动马上就要结束了！"
+    else:
+        header = "🚨 活动马上就要结束了！"
+    return _assemble(header, blocks, settings.activity_separator)
+
+
+def build_urgent_dm_message(
+    activities: Sequence[Activity],
+    now: datetime,
+    settings: MessageSettings,
+    *,
+    ack_hint: str = "",
+) -> str:
+    return parts_to_text(
+        build_urgent_dm_parts(activities, now, settings, ack_hint=ack_hint)
     )

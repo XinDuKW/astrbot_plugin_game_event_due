@@ -14,7 +14,11 @@ from astrbot.api import logger
 from ..sources.base import Activity, GAME_TIMEZONE, Game, filter_relevant
 from ..sources.registry import GameRegistry
 from .delivery_service import ActivityDeliveryService
-from .message_formatter import MessageSettings, build_overview_parts
+from .message_formatter import (
+    MessageSettings,
+    build_overview_parts,
+    build_urgent_dm_parts,
+)
 from .reminder_service import (
     ActivityNotifyState,
     ReminderPlan,
@@ -27,6 +31,12 @@ from .subscription_service import (
     SubscriptionService,
     resolve_message_settings,
     resolve_policy,
+)
+from .urgent_dm_service import (
+    UrgentDmSettings,
+    UrgentTargetState,
+    mark_sent,
+    urgent_activities,
 )
 
 
@@ -41,6 +51,7 @@ class PollingSettings:
     notify_on_subscribe: bool = True
     retention_days: int = 30
     overview_memo_seconds: int = 300
+    urgent_dm: UrgentDmSettings = field(default_factory=UrgentDmSettings)
 
 
 @dataclass(slots=True)
@@ -184,20 +195,36 @@ class ActivityPollingService:
             for umo, session in sessions.items()
             if session.get("enabled") and session.get("games")
         }
-        if not active_sessions:
+
+        urgent_settings = self.settings.urgent_dm
+        urgent_data: dict[str, dict[str, Any]] = {}
+        urgent_targets: dict[str, dict[str, Any]] = {}
+        if urgent_settings.enabled:
+            urgent_data = await self.subscriptions.get_urgent_dm()
+            urgent_targets = {
+                umo: entry
+                for umo, entry in urgent_data.items()
+                if entry.get("enabled")
+            }
+
+        # 只有私聊提醒目标、没有任何订阅会话时，也要能跑起来
+        if not active_sessions and not urgent_targets:
             report.finished_at = datetime.now(GAME_TIMEZONE)
             self.last_report = report
             return report
 
         known_games = self.registry.games
-        needed = sorted(
-            {
-                game_id
-                for session in active_sessions.values()
-                for game_id in session["games"]
-            }
-            & set(known_games)
-        )
+        subscribed_games = {
+            game_id
+            for session in active_sessions.values()
+            for game_id in session["games"]
+        }
+        needed_games = set(subscribed_games)
+        if urgent_targets:
+            needed_games |= self._urgent_games(
+                urgent_targets, urgent_settings, subscribed_games
+            )
+        needed = sorted(needed_games & set(known_games))
 
         fetched: dict[str, list[Activity]] = {}
         for game_id in needed:
@@ -271,6 +298,16 @@ class ActivityPollingService:
         if dirty or report.pruned:
             await self.subscriptions.save_notify_state(notify_state)
 
+        if urgent_targets:
+            urgent_dirty = await self._deliver_urgent_dm(
+                urgent_data, urgent_targets, fetched, now, report
+            )
+            urgent_pruned = self.subscriptions.prune_urgent_dm(
+                urgent_data, now, self.settings.retention_days
+            )
+            if urgent_dirty or urgent_pruned:
+                await self.subscriptions.save_urgent_dm(urgent_data)
+
         report.finished_at = datetime.now(GAME_TIMEZONE)
         self.last_report = report
         if report.reminders:
@@ -281,6 +318,90 @@ class ActivityPollingService:
         if report.failures:
             logger.warning(f"本轮数据源异常: {report.failures}")
         return report
+
+    # ---- 紧急私聊提醒 ----
+
+    @staticmethod
+    def _urgent_games(
+        targets: dict[str, dict[str, Any]],
+        settings: UrgentDmSettings,
+        subscribed_games: set[str],
+    ) -> set[str]:
+        """私聊提醒需要拉取哪些游戏。
+
+        优先级：目标自己的限定 > 全局限定 > 当前被订阅的游戏（避免无谓的外部请求）。
+        """
+        needed: set[str] = set()
+        for entry in targets.values():
+            override = {
+                str(game).strip()
+                for game in (entry.get("games") or [])
+                if str(game).strip()
+            }
+            if override:
+                needed |= override
+            elif settings.games:
+                needed |= set(settings.games)
+            else:
+                needed |= subscribed_games
+        return needed
+
+    @staticmethod
+    def _urgent_ack_hint() -> str:
+        return "（回一句「/我已知晓」就不会再催你了）"
+
+    async def _deliver_urgent_dm(
+        self,
+        urgent_data: dict[str, dict[str, Any]],
+        targets: dict[str, dict[str, Any]],
+        fetched: dict[str, list[Activity]],
+        now: datetime,
+        report: CycleReport,
+    ) -> bool:
+        """给每个被点名的目标发紧急私聊提醒。
+
+        一个目标一条消息，消息里包含该目标本轮所有进入档位、且还没被确认的活动；
+        只有真正送达才会写状态，失败留到下一轮重试。
+        """
+        settings = self.settings.urgent_dm
+        dirty = False
+
+        for umo, entry in targets.items():
+            states = entry.get("activities") or {}
+            game_ids = [
+                str(game).strip()
+                for game in (entry.get("games") or settings.games or tuple(fetched))
+                if str(game).strip()
+            ]
+            pending: list[Activity] = []
+            for game_id in game_ids:
+                activities = fetched.get(game_id)
+                if not activities:
+                    continue
+                pending.extend(urgent_activities(activities, now, settings, states))
+            if not pending:
+                continue
+
+            parts = build_urgent_dm_parts(
+                pending,
+                now,
+                self.message_settings,
+                ack_hint=self._urgent_ack_hint(),
+            )
+            if not await self.delivery.send_parts(umo, parts, self.message_settings):
+                continue
+
+            report.messages += 1
+            report.reminders += len(pending)
+            for activity in pending:
+                state = UrgentTargetState.from_dict(states.get(activity.uid))
+                mark_sent(state, now)
+                self.subscriptions.record_urgent_state(
+                    urgent_data, umo, activity, state
+                )
+            dirty = True
+
+        return dirty
 
     # ---- 订阅后的初始概览 ----
 

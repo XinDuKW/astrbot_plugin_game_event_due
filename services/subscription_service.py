@@ -27,9 +27,11 @@ from .reminder_service import (
     normalize_keywords,
     normalize_thresholds,
 )
+from .urgent_dm_service import UrgentTargetState, mark_acked
 
 SUBSCRIPTIONS_KEY = "game_event_due_subscriptions_v1"
 NOTIFY_STATE_KEY = "game_event_due_notify_state_v1"
+URGENT_DM_KEY = "game_event_due_urgent_dm_v1"
 
 MAX_GAMES_PER_SESSION = 32
 MAX_KEYWORDS = 50
@@ -427,3 +429,173 @@ class SubscriptionService:
         umo: str,
     ) -> None:
         data.pop(umo, None)
+
+    # ---- 紧急私聊提醒的目标与状态 ----
+
+    async def get_urgent_dm(self) -> dict[str, dict[str, Any]]:
+        raw = await self._get_kv(URGENT_DM_KEY, {})
+        return self._normalize_urgent_dm(raw)
+
+    @staticmethod
+    def _normalize_urgent_dm(raw: Any) -> dict[str, dict[str, Any]]:
+        """规范化私聊提醒目标：保留启用状态、限定游戏与每个活动的提醒进度。"""
+        if not isinstance(raw, dict):
+            return {}
+        targets = raw.get("targets")
+        if not isinstance(targets, dict):
+            return {}
+
+        result: dict[str, dict[str, Any]] = {}
+        for umo, entry in targets.items():
+            key = str(umo or "").strip()
+            if not key or not isinstance(entry, dict):
+                continue
+            activities: dict[str, dict[str, Any]] = {}
+            raw_activities = entry.get("activities")
+            if isinstance(raw_activities, dict):
+                for uid, state in raw_activities.items():
+                    if not isinstance(state, dict):
+                        continue
+                    payload = UrgentTargetState.from_dict(state).to_dict()
+                    name = str(state.get("name") or "")
+                    if name:
+                        payload["name"] = name
+                    end_value = state.get("end")
+                    if isinstance(end_value, str) and end_value:
+                        payload["end"] = end_value
+                    if payload:
+                        activities[str(uid)] = payload
+            result[key] = {
+                "enabled": bool(entry.get("enabled", True)),
+                "games": [
+                    str(game).strip()
+                    for game in (entry.get("games") or [])
+                    if str(game).strip()
+                ],
+                "note": str(entry.get("note") or ""),
+                "activities": activities,
+            }
+        return result
+
+    async def save_urgent_dm(self, data: dict[str, dict[str, Any]]) -> None:
+        async with self._lock:
+            await self._put_kv(
+                URGENT_DM_KEY,
+                {"targets": {umo: entry for umo, entry in data.items() if entry}},
+            )
+
+    @staticmethod
+    def upsert_urgent_target(
+        data: dict[str, dict[str, Any]],
+        umo: str,
+        *,
+        enabled: bool = True,
+        games: list[str] | None = None,
+        note: str = "",
+    ) -> dict[str, Any]:
+        """新增或更新一个私聊提醒目标，返回该目标的记录。"""
+        entry = data.get(umo)
+        if not isinstance(entry, dict):
+            entry = {"enabled": True, "games": [], "note": "", "activities": {}}
+            data[umo] = entry
+        entry["enabled"] = bool(enabled)
+        if games is not None:
+            entry["games"] = [str(game) for game in games if str(game).strip()]
+        if note:
+            entry["note"] = str(note)
+        entry.setdefault("games", [])
+        entry.setdefault("note", "")
+        entry.setdefault("activities", {})
+        return entry
+
+    @staticmethod
+    def remove_urgent_target(data: dict[str, dict[str, Any]], umo: str) -> bool:
+        return data.pop(umo, None) is not None
+
+    @staticmethod
+    def record_urgent_state(
+        data: dict[str, dict[str, Any]],
+        umo: str,
+        activity: Activity,
+        state: UrgentTargetState,
+    ) -> None:
+        """写入某个目标对某个活动的提醒进度（附带活动名与结束时间）。"""
+        entry = data.get(umo)
+        if not isinstance(entry, dict):
+            entry = {"enabled": True, "games": [], "note": "", "activities": {}}
+            data[umo] = entry
+        bucket = entry.setdefault("activities", {})
+        payload = state.to_dict()
+        if payload:
+            payload["name"] = activity.name
+        if activity.end_time is not None:
+            payload["end"] = activity.end_time.isoformat()
+        if payload:
+            bucket[activity.uid] = payload
+        else:
+            bucket.pop(activity.uid, None)
+
+    @staticmethod
+    def ack_urgent_activities(
+        data: dict[str, dict[str, Any]],
+        umo: str,
+        now: datetime,
+        keywords: Sequence[str] = (),
+    ) -> list[str]:
+        """把目标的活动标记为「已知晓」，返回被确认的活动名。
+
+        keywords 为空表示确认全部；否则只确认名字命中关键词的活动，这样用户可以
+        只停掉某一个活动，而不影响其它正在提醒的活动。
+        """
+        entry = data.get(umo)
+        bucket = entry.get("activities") if isinstance(entry, dict) else None
+        if not isinstance(bucket, dict):
+            return []
+
+        acked: list[str] = []
+        for uid, raw in list(bucket.items()):
+            if not isinstance(raw, dict):
+                continue
+            name = str(raw.get("name") or "")
+            if keywords and not any(
+                keyword.casefold() in name.casefold()
+                for keyword in keywords
+                if keyword
+            ):
+                continue
+            state = UrgentTargetState.from_dict(raw)
+            if state.acked:
+                continue
+            mark_acked(state, now)
+            payload = state.to_dict()
+            payload["name"] = name
+            end_value = raw.get("end")
+            if isinstance(end_value, str) and end_value:
+                payload["end"] = end_value
+            bucket[uid] = payload
+            acked.append(name or uid)
+        return acked
+
+    @staticmethod
+    def prune_urgent_dm(
+        data: dict[str, dict[str, Any]],
+        now: datetime,
+        retention_days: int,
+    ) -> int:
+        """清理结束很久的私聊提醒记录；仍在启用的目标本身会被保留。"""
+        cutoff = now - timedelta(days=max(0, retention_days))
+        removed = 0
+        for umo in list(data.keys()):
+            entry = data.get(umo)
+            bucket = entry.get("activities") if isinstance(entry, dict) else None
+            if not isinstance(bucket, dict):
+                data.pop(umo, None)
+                continue
+            for uid in list(bucket.keys()):
+                end_time = parse_datetime((bucket[uid] or {}).get("end"))
+                if end_time is not None and end_time < cutoff:
+                    bucket.pop(uid, None)
+                    removed += 1
+            if not bucket and not entry.get("enabled"):
+                data.pop(umo, None)
+        return removed

@@ -129,10 +129,14 @@ def format_remaining(delta: timedelta | None) -> str:
     days, remainder = divmod(total_seconds, 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes = remainder // 60
-    if days:
+    if days and hours:
         return f"{days}天{hours}小时"
-    if hours:
+    if days:
+        return f"{days}天"
+    if hours and minutes:
         return f"{hours}小时{minutes}分"
+    if hours:
+        return f"{hours}小时"
     return f"{minutes}分"
 
 

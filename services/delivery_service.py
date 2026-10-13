@@ -25,8 +25,11 @@ from .cover_service import CoverResolver, select_within_budget
 from .message_formatter import (
     MessagePart,
     MessageSettings,
+    build_activity_block,
     build_reminder_parts,
     build_single_reminder_parts,
+    display_game_name,
+    sort_plans_by_urgency,
 )
 from .reminder_service import ReminderPlan
 
@@ -156,32 +159,109 @@ class ActivityDeliveryService:
             )
         return chain
 
+    @staticmethod
+    def build_forward_chain(
+        node_chains: Sequence[Sequence[Any]],
+        node_name: str,
+    ) -> list[Any] | None:
+        """把若干节点内容包成一条转发消息链；平台不支持时返回 None。"""
+        node_class = getattr(Comp, "Node", None)
+        nodes_class = getattr(Comp, "Nodes", None)
+        if not (node_class and nodes_class) or not node_chains:
+            return None
+        nodes = [
+            node_class(content=list(chain), name=node_name)
+            for chain in node_chains
+            if chain
+        ]
+        if not nodes:
+            return None
+        return [nodes_class(nodes)]
+
     async def build_event_chain(
         self,
         parts: Sequence[MessagePart],
         settings: MessageSettings | None = None,
+        *,
+        node_name: str = NODE_NAME,
     ) -> list[Any]:
-        """供指令回复使用：解析封面后返回可直接 yield 的消息链。"""
-        return self.build_chain(await self.resolve_parts(parts, settings))
+        """供指令回复使用：解析封面后返回可直接 yield 的消息链。
+
+        开启合并转发时返回「一个节点包住整条消息」的转发链（指令回复同样要能
+        折叠，否则只有定时提醒会转发）；平台不支持时原样返回普通链。
+        """
+        effective = settings or self.settings
+        chain = self.build_chain(await self.resolve_parts(parts, effective))
+        if effective.use_forward_node:
+            forward = self.build_forward_chain([chain], node_name)
+            if forward is not None:
+                return forward
+        return chain
 
     # ---- 发送 ----
+
+    @staticmethod
+    def _ordered_plans(
+        plans: Sequence[ReminderPlan],
+        now,
+        settings: MessageSettings,
+    ) -> list[ReminderPlan]:
+        if settings.sort_by_urgency:
+            return sort_plans_by_urgency(plans, now)
+        return list(plans)
+
+    async def _build_forward_nodes(
+        self,
+        plans: Sequence[ReminderPlan],
+        now,
+        settings: MessageSettings,
+    ) -> list[list[Any]]:
+        """把每个活动构建成一条独立的转发节点内容。"""
+        chains: list[list[Any]] = []
+        for plan in plans:
+            parts = build_activity_block(
+                plan.activity, plan.reasons, now, settings
+            )
+            try:
+                items = await self.resolve_parts(parts, settings)
+            except Exception as exc:
+                logger.warning(f"封面解析失败，改为只发文字与封面链接: {exc}")
+                items = self._text_only(parts)
+            chain = self.build_chain(items)
+            if chain:
+                chains.append(chain)
+        return chains
+
+    async def _send_as_forward_nodes(
+        self,
+        umo: str,
+        node_chains: Sequence[Sequence[Any]],
+        node_name: str,
+    ) -> bool:
+        """把若干节点内容合并成一条转发消息发送。
+
+        一个游戏只发一条转发消息，游戏内的每个活动各自成为一个节点。返回
+        False 表示当前环境不支持或发送失败，调用方应回退为普通消息。
+        """
+        chain = self.build_forward_chain(node_chains, node_name)
+        if chain is None:
+            return False
+        try:
+            await self.context.send_message(umo, MessageChain(chain=chain))
+            return True
+        except Exception as exc:
+            logger.warning(f"合并转发发送失败，回退为普通消息: {exc}")
+            return False
 
     async def _try_send(self, umo: str, chain: Sequence[Any]) -> bool:
         if not chain:
             return True
 
-        node_class = getattr(Comp, "Node", None)
-        nodes_class = getattr(Comp, "Nodes", None)
-        if self.settings.use_forward_node and node_class and nodes_class:
-            try:
-                node = node_class(content=list(chain), name=NODE_NAME)
-                await self.context.send_message(
-                    umo,
-                    MessageChain(chain=[nodes_class([node])]),
-                )
-                return True
-            except Exception as exc:
-                logger.warning(f"合并转发发送失败，回退为普通消息: {exc}")
+        # 与提醒推送共用同一套转发实现：支持就转发，不支持或失败就回退普通消息
+        if self.settings.use_forward_node and await self._send_as_forward_nodes(
+            umo, [chain], NODE_NAME
+        ):
+            return True
 
         try:
             await self.context.send_message(
@@ -244,6 +324,15 @@ class ActivityDeliveryService:
             return []
 
         effective = settings or self.settings
+
+        # 合并转发：一个游戏一条转发消息，游戏内的每个活动各自成为一个节点。
+        # 多个游戏之间不合并——每个游戏仍然是自己的一条转发消息。
+        if effective.use_forward_node:
+            ordered = self._ordered_plans(plans, now, effective)
+            chains = await self._build_forward_nodes(ordered, now, effective)
+            node_name = display_game_name(game, effective)
+            if await self._send_as_forward_nodes(umo, chains, node_name):
+                return list(plans)
 
         if effective.single_message_per_game:
             parts = build_reminder_parts(game, plans, now, effective)

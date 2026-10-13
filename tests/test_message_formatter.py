@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta
 
 import pytest
@@ -11,6 +12,8 @@ from astrbot_plugin_game_event_due.services.message_formatter import (
     COVER_MODE_LINK,
     COVER_MODE_OFF,
     DEFAULT_ACTIVITY_SEPARATOR,
+    DEFAULT_URGENCY_LEVELS,
+    DEFAULT_URGENCY_RULES,
     PART_IMAGE,
     PART_TEXT,
     MessagePart,
@@ -22,8 +25,11 @@ from astrbot_plugin_game_event_due.services.message_formatter import (
     build_single_reminder_message,
     build_single_reminder_parts,
     normalize_cover_mode,
+    normalize_game_aliases,
+    parse_urgency_rules,
     parts_to_text,
     truncate,
+    urgency_level_for,
 )
 from astrbot_plugin_game_event_due.services.reminder_service import ReminderPlan
 from astrbot_plugin_game_event_due.sources.base import Activity, GAME_TIMEZONE
@@ -32,6 +38,8 @@ from astrbot_plugin_game_event_due.sources.sra import SRA_GAMES
 NOW = datetime(2026, 9, 10, 12, 0, tzinfo=GAME_TIMEZONE)
 GAME = next(game for game in SRA_GAMES if game.game_id == "sr")
 SETTINGS = MessageSettings()
+# 关闭新加的标记与标题剩余时间，用于验证与这些无关的排版行为
+PLAIN_SETTINGS = MessageSettings(urgency_marker=False, headline_remaining=False)
 COVER = "https://example.com/cover.png"
 
 
@@ -139,7 +147,7 @@ def test_d1_uses_24_hour_label():
         GAME, make_plan(activity, ("d1",), "d1"), NOW, SETTINGS
     )
     assert "【剩余不足24小时】" in text
-    assert "剩余 5小时0分" in text
+    assert "剩余 5小时" in text
 
 
 def test_single_reminder_message_repeats_header():
@@ -363,8 +371,9 @@ def test_overview_parts_carry_images_and_section_titles():
 
     text = parts_to_text(parts)
     # 分段标题必须紧挨着它自己那一批活动，不能被挤到消息开头
-    assert "▎进行中（1）\n\n进行中" in text
-    assert "▎即将开始（1）\n\n即将开始" in text
+    # （活动标题前会带剩余时间标记，这里用正则跳过它）
+    assert re.search(r"▎进行中（1）\n\n\S+ 进行中", text)
+    assert re.search(r"▎即将开始（1）\n\n\S+ 即将开始", text)
     assert text.index("▎进行中（1）") < text.index("▎即将开始（1）") < text.index("（数据来源：SRA）")
 
 
@@ -420,7 +429,7 @@ def make_plans(names: list[str], *, with_cover: bool = False) -> list[ReminderPl
 
 
 def test_separator_inserted_between_activities():
-    parts = build_reminder_parts(GAME, make_plans(["甲", "乙"]), NOW, SETTINGS)
+    parts = build_reminder_parts(GAME, make_plans(["甲", "乙"]), NOW, PLAIN_SETTINGS)
     text = parts_to_text(parts)
     assert DEFAULT_ACTIVITY_SEPARATOR in text
     # 分隔线紧跟在「甲」那一块之后，紧挨着「乙」的标题
@@ -428,7 +437,7 @@ def test_separator_inserted_between_activities():
 
 
 def test_separator_not_before_first_activity():
-    parts = build_reminder_parts(GAME, make_plans(["甲", "乙"]), NOW, SETTINGS)
+    parts = build_reminder_parts(GAME, make_plans(["甲", "乙"]), NOW, PLAIN_SETTINGS)
     text = parts_to_text(parts)
 
     header, _, rest = text.partition("\n\n")
@@ -457,7 +466,9 @@ def test_single_activity_has_no_separator():
 
 
 def test_empty_separator_falls_back_to_blank_line():
-    settings = MessageSettings(activity_separator="")
+    settings = MessageSettings(
+        activity_separator="", urgency_marker=False, headline_remaining=False
+    )
     parts = build_reminder_parts(GAME, make_plans(["甲", "乙"]), NOW, settings)
     text = parts_to_text(parts)
     assert DEFAULT_ACTIVITY_SEPARATOR not in text
@@ -465,7 +476,9 @@ def test_empty_separator_falls_back_to_blank_line():
 
 
 def test_custom_separator_is_used():
-    settings = MessageSettings(activity_separator="------")
+    settings = MessageSettings(
+        activity_separator="------", urgency_marker=False, headline_remaining=False
+    )
     parts = build_reminder_parts(GAME, make_plans(["甲", "乙"]), NOW, settings)
     assert "\n\n------\n\n【新活动】乙" in parts_to_text(parts)
 
@@ -495,11 +508,13 @@ def test_separator_not_inserted_after_section_heading():
     text = parts_to_text(parts)
 
     # 分段标题紧跟它自己的第一个活动，不能被分隔线割开
-    assert "▎进行中（2）\n\n进行中1" in text
-    assert "▎即将开始（1）\n\n即将开始1" in text
+    assert re.search(r"▎进行中（2）\n\n\S+ 进行中1", text)
+    assert re.search(r"▎即将开始（1）\n\n\S+ 即将开始1", text)
     # 只有「进行中1 / 进行中2」这一处插入分隔线
     assert text.count(DEFAULT_ACTIVITY_SEPARATOR) == 1
-    assert f"\n\n{DEFAULT_ACTIVITY_SEPARATOR}\n\n进行中2" in text
+    assert re.search(
+        rf"\n\n{DEFAULT_ACTIVITY_SEPARATOR}\n\n\S+ 进行中2", text
+    )
 
 
 def test_separator_no_extra_blank_lines():
@@ -508,3 +523,134 @@ def test_separator_no_extra_blank_lines():
     )
     text = parts_to_text(parts)
     assert "\n\n\n" not in text
+
+
+# ---- 剩余时间标记与排序 ----
+
+
+def test_urgency_level_picks_most_urgent_bucket():
+    rules = parse_urgency_rules(DEFAULT_URGENCY_RULES)
+    assert urgency_level_for(timedelta(hours=6), rules).marker == "🟥"
+    assert urgency_level_for(timedelta(days=2), rules).marker == "🟧"
+    assert urgency_level_for(timedelta(days=6), rules).marker == "🟩"
+    assert urgency_level_for(timedelta(days=30), rules).marker == "🟦"
+    assert urgency_level_for(timedelta(seconds=-1), rules) is None
+    assert urgency_level_for(None, rules) is None
+
+
+def test_urgency_rules_accept_color_names():
+    rules = parse_urgency_rules("2:红,5:橙")
+    assert [level.marker for level in rules] == ["🟥", "🟧"]
+    assert urgency_level_for(timedelta(days=9), rules) is None
+
+
+def test_urgency_rules_support_fallback_bucket():
+    rules = parse_urgency_rules("2:红,*:蓝")
+    assert urgency_level_for(timedelta(days=9), rules).marker == "🟦"
+
+
+def test_urgency_rules_fall_back_to_defaults_on_garbage():
+    assert parse_urgency_rules("完全看不懂") == DEFAULT_URGENCY_LEVELS
+    assert parse_urgency_rules("") == DEFAULT_URGENCY_LEVELS
+    assert parse_urgency_rules(None) == DEFAULT_URGENCY_LEVELS
+
+
+def test_headline_carries_marker_and_remaining_time():
+    activity = make_activity("活动", end=timedelta(hours=6))
+    text = build_reminder_message(
+        GAME, [make_plan(activity, ("d1",), "d1")], NOW, SETTINGS
+    )
+    assert "🟥 【剩余不足24小时】活动（剩余 6小时）" in text
+
+
+def test_marker_and_summary_can_be_disabled():
+    settings = MessageSettings(urgency_marker=False)
+    activity = make_activity("活动", end=timedelta(hours=6))
+    text = build_reminder_message(GAME, [make_plan(activity)], NOW, settings)
+    assert "🟥" not in text
+    assert text.startswith("🎮 崩坏：星穹铁道 · 活动提醒\n")
+
+
+def test_header_carries_tier_summary():
+    plans = [
+        make_plan(make_activity("急", activity_id="a", end=timedelta(hours=6))),
+        make_plan(make_activity("缓", activity_id="b", end=timedelta(days=6))),
+    ]
+    text = build_reminder_message(GAME, plans, NOW, SETTINGS)
+    assert "🟥1 🟩1" in text
+
+
+def test_tier_summary_can_be_disabled():
+    settings = MessageSettings(tier_summary=False)
+    plans = [make_plan(make_activity("急", end=timedelta(hours=6)))]
+    text = build_reminder_message(GAME, plans, NOW, settings)
+    assert text.startswith("🎮 崩坏：星穹铁道 · 活动提醒\n")
+
+
+def test_sort_by_urgency_puts_the_soonest_first():
+    plans = [
+        make_plan(make_activity("缓", activity_id="b", end=timedelta(days=6))),
+        make_plan(make_activity("急", activity_id="a", end=timedelta(hours=2))),
+    ]
+    text = build_reminder_message(GAME, plans, NOW, SETTINGS)
+    assert text.index("急") < text.index("缓")
+
+    kept = parts_to_text(
+        build_reminder_parts(GAME, plans, NOW, MessageSettings(sort_by_urgency=False))
+    )
+    assert kept.index("缓") < kept.index("急")
+
+
+def test_overview_also_marks_activities():
+    activities = [
+        make_activity("进行中", activity_id="a", start=timedelta(days=-2), end=timedelta(days=2)),
+    ]
+    text = build_overview_message(GAME, activities, NOW, SETTINGS)
+    assert "🟧 进行中（剩余 2天）" in text
+
+
+# ---- 游戏显示名（别名） ----
+
+
+def test_normalize_game_aliases_parses_pairs():
+    assert normalize_game_aliases("sr=星铁, arknights:舟游") == (
+        ("sr", "星铁"),
+        ("arknights", "舟游"),
+    )
+    assert normalize_game_aliases("ys=原神\nZZZ＝绝区零") == (
+        ("ys", "原神"),
+        ("zzz", "绝区零"),
+    )
+    assert normalize_game_aliases(["ys=原神", "  ", "坏的"]) == (("ys", "原神"),)
+    assert normalize_game_aliases("") == ()
+    # 同一个键只认第一条
+    assert normalize_game_aliases("sr=A,sr=B") == (("sr", "A"),)
+
+
+def test_display_game_name_uses_alias():
+    aliased = MessageSettings(game_aliases=(("sr", "星铁"),))
+    text = build_reminder_message(GAME, [make_plan(make_activity("活动"))], NOW, aliased)
+    assert text.startswith("🎮 星铁 · 活动提醒")
+
+    # 内置别名（starrail）同样能命中
+    by_alias = MessageSettings(game_aliases=(("starrail", "SR"),))
+    assert build_reminder_message(
+        GAME, [make_plan(make_activity("活动"))], NOW, by_alias
+    ).startswith("🎮 SR · 活动提醒")
+
+    # 完整名称也能命中
+    by_name = MessageSettings(game_aliases=(("崩坏：星穹铁道", "崩铁"),))
+    assert build_reminder_message(
+        GAME, [make_plan(make_activity("活动"))], NOW, by_name
+    ).startswith("🎮 崩铁 · 活动提醒")
+
+    # 没配置就保持原样
+    assert build_reminder_message(
+        GAME, [make_plan(make_activity("活动"))], NOW, MessageSettings()
+    ).startswith("🎮 崩坏：星穹铁道 · 活动提醒")
+
+
+def test_alias_applies_to_overview_header():
+    settings = MessageSettings(game_aliases=(("sr", "星铁"),))
+    text = build_overview_message(GAME, [make_activity("活动")], NOW, settings)
+    assert text.startswith("🎮 星铁 · 当前活动")
