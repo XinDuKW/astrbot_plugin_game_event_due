@@ -18,6 +18,7 @@ from .message_formatter import (
     MessageSettings,
     build_overview_parts,
     build_urgent_dm_parts,
+    display_game_name,
 )
 from .reminder_service import (
     ActivityNotifyState,
@@ -388,7 +389,18 @@ class ActivityPollingService:
                 self.message_settings,
                 ack_hint=self._urgent_ack_hint(),
             )
-            if not await self.delivery.send_parts(umo, parts, self.message_settings):
+            node_name = "活动提醒"
+            if len({activity.game_id for activity in pending}) == 1:
+                game = self.registry.games.get(pending[0].game_id)
+                if game is not None:
+                    node_name = display_game_name(game, self.message_settings)
+            if not await self.delivery.send_parts(
+                umo,
+                parts,
+                self.message_settings,
+                node_name=node_name,
+                forward_title="🚨 活动马上就要结束了！",
+            ):
                 continue
 
             report.messages += 1
@@ -445,7 +457,15 @@ class ActivityPollingService:
                 settings,
                 source_name=self.registry.source_name(game.game_id),
             )
-            if await self.delivery.send_parts(umo, parts, settings):
+            if await self.delivery.send_parts(
+                umo,
+                parts,
+                settings,
+                node_name=display_game_name(game, settings),
+                forward_title=(
+                    f"🎮 {display_game_name(game, settings)} · 当前活动"
+                ),
+            ):
                 sent += 1
                 bucket.update(initialized)
                 dirty = True

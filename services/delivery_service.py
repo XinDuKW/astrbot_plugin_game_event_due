@@ -30,6 +30,7 @@ from .message_formatter import (
     build_single_reminder_parts,
     display_game_name,
     sort_plans_by_urgency,
+    summarize_markers,
 )
 from .reminder_service import ReminderPlan
 
@@ -160,6 +161,28 @@ class ActivityDeliveryService:
         return chain
 
     @staticmethod
+    def _plain_chain(text: str) -> list[Any]:
+        return [Comp.Plain(text)] if text else []
+
+    @staticmethod
+    def _forward_title(
+        game_name: str,
+        plans: Sequence[ReminderPlan],
+        now,
+        settings: MessageSettings,
+    ) -> str:
+        """转发里的第一条：游戏名 + 档位统计，顺便把节点数撑到 2 个。
+
+        QQ 只有 2 个以上节点时才显示「群聊的聊天记录」，单节点会显示成
+        「xxx的聊天记录」，所以固定带一个标题节点。
+        """
+        summary = summarize_markers(
+            [plan.activity for plan in plans], now, settings
+        )
+        base = f"🎮 {game_name} · 活动提醒"
+        return f"{base}  {summary}" if summary else base
+
+    @staticmethod
     def build_forward_chain(
         node_chains: Sequence[Sequence[Any]],
         node_name: str,
@@ -184,16 +207,18 @@ class ActivityDeliveryService:
         settings: MessageSettings | None = None,
         *,
         node_name: str = NODE_NAME,
+        forward_title: str = "",
     ) -> list[Any]:
         """供指令回复使用：解析封面后返回可直接 yield 的消息链。
 
-        开启合并转发时返回「一个节点包住整条消息」的转发链（指令回复同样要能
-        折叠，否则只有定时提醒会转发）；平台不支持时原样返回普通链。
+        开启合并转发时返回转发链（标题节点 + 正文节点，保证外层显示「群聊的
+        聊天记录」）；平台不支持时原样返回普通链。
         """
         effective = settings or self.settings
         chain = self.build_chain(await self.resolve_parts(parts, effective))
         if effective.use_forward_node:
-            forward = self.build_forward_chain([chain], node_name)
+            nodes = [self._plain_chain(forward_title), chain]
+            forward = self.build_forward_chain(nodes, node_name)
             if forward is not None:
                 return forward
         return chain
@@ -253,15 +278,24 @@ class ActivityDeliveryService:
             logger.warning(f"合并转发发送失败，回退为普通消息: {exc}")
             return False
 
-    async def _try_send(self, umo: str, chain: Sequence[Any]) -> bool:
+    async def _try_send(
+        self,
+        umo: str,
+        chain: Sequence[Any],
+        settings: MessageSettings | None = None,
+        *,
+        node_name: str = NODE_NAME,
+        forward_title: str = "",
+    ) -> bool:
         if not chain:
             return True
 
+        effective = settings or self.settings
         # 与提醒推送共用同一套转发实现：支持就转发，不支持或失败就回退普通消息
-        if self.settings.use_forward_node and await self._send_as_forward_nodes(
-            umo, [chain], NODE_NAME
-        ):
-            return True
+        if effective.use_forward_node:
+            nodes = [self._plain_chain(forward_title), chain]
+            if await self._send_as_forward_nodes(umo, nodes, node_name):
+                return True
 
         try:
             await self.context.send_message(
@@ -278,24 +312,42 @@ class ActivityDeliveryService:
         umo: str,
         parts: Sequence[MessagePart],
         settings: MessageSettings | None = None,
+        *,
+        node_name: str = NODE_NAME,
+        forward_title: str = "",
     ) -> bool:
-        """发送消息片段；失败时逐级降级，尽量把内容送达。"""
+        """发送消息片段；失败时逐级降级，尽量把内容送达。
+
+        node_name 决定转发消息里每条的前缀（用游戏显示名），forward_title 是
+        转发里的标题节点。
+        """
         if not parts:
             return True
 
+        effective = settings or self.settings
         try:
-            items = await self.resolve_parts(parts, settings)
+            items = await self.resolve_parts(parts, effective)
         except Exception as exc:
             logger.warning(f"封面解析失败，改为只发文字与封面链接: {exc}")
             items = self._text_only(parts)
 
-        if await self._try_send(umo, self.build_chain(items)):
+        if await self._try_send(
+            umo,
+            self.build_chain(items),
+            effective,
+            node_name=node_name,
+            forward_title=forward_title,
+        ):
             return True
 
         if any(item.is_image for item in items):
             logger.warning(f"含封面的消息未能送达 {umo}，改为发送封面链接重试")
             if await self._try_send(
-                umo, self.build_chain(items, images_as_links=True)
+                umo,
+                self.build_chain(items, images_as_links=True),
+                effective,
+                node_name=node_name,
+                forward_title=forward_title,
             ):
                 return True
 
@@ -331,16 +383,38 @@ class ActivityDeliveryService:
             ordered = self._ordered_plans(plans, now, effective)
             chains = await self._build_forward_nodes(ordered, now, effective)
             node_name = display_game_name(game, effective)
-            if await self._send_as_forward_nodes(umo, chains, node_name):
+            title = self._forward_title(node_name, ordered, now, effective)
+            nodes = [self._plain_chain(title)] + chains
+            if await self._send_as_forward_nodes(umo, nodes, node_name):
                 return list(plans)
 
+        node_name = display_game_name(game, effective)
+        title = self._forward_title(node_name, plans, now, effective)
         if effective.single_message_per_game:
             parts = build_reminder_parts(game, plans, now, effective)
-            return list(plans) if await self.send_parts(umo, parts, effective) else []
+            return (
+                list(plans)
+                if await self.send_parts(
+                    umo,
+                    parts,
+                    effective,
+                    node_name=node_name,
+                    forward_title=title,
+                )
+                else []
+            )
 
         delivered: list[ReminderPlan] = []
         for plan in plans:
             parts = build_single_reminder_parts(game, plan, now, effective)
-            if await self.send_parts(umo, parts, effective):
+            if await self.send_parts(
+                umo,
+                parts,
+                effective,
+                node_name=node_name,
+                forward_title=self._forward_title(
+                    node_name, [plan], now, effective
+                ),
+            ):
                 delivered.append(plan)
         return delivered

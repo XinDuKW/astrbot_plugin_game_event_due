@@ -590,6 +590,9 @@ class GameActivityPlugin(Star):
                     parts,
                     settings,
                     node_name=display_game_name(game, settings),
+                    forward_title=(
+                        f"🎮 {display_game_name(game, settings)} · 当前活动"
+                    ),
                 )
             )
 
