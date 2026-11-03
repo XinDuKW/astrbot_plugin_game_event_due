@@ -298,6 +298,12 @@
         "default": true,
         "hint": "关闭后按活动开始时间排序。"
       },
+      "image_mode_detail_link": {
+        "description": "图片模式下仍附详情链接",
+        "type": "bool",
+        "default": false,
+        "hint": "默认关闭：活动带封面图时不再输出「详情：链接」。没有封面的活动仍会给出链接；封面模式为「链接」时不受影响。"
+      },
       "game_aliases": {
         "description": "自定义游戏显示名称",
         "type": "text",

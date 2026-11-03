@@ -19,7 +19,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from collections.abc import Sequence
-from urllib.parse import urlencode
+import hashlib
+from urllib.parse import quote, urlencode
 
 from .base import (
     Activity,
@@ -89,6 +90,28 @@ def parse_smw_timestamp(value: Any) -> datetime | None:
         )
     except (OverflowError, OSError, ValueError):
         return None
+
+
+PRTS_MEDIA_BASE = "https://media.prts.wiki"
+
+
+def _cover_url(printouts: dict) -> str:
+    """按 MediaWiki 的 md5 分片规则拼出活动封面地址。
+
+    PRTS 的图片放在 media.prts.wiki，路径是文件名 md5 的前 1 位 / 前 2 位分片
+    （例如 md5=65f1... → /6/65/文件名）。PRTS 上的 Special:FilePath 会 404，
+    所以只能自己算。字段为空表示这个活动没有标题图。
+    """
+    name = _first_text(printouts, "标题图文件名")
+    name = name.strip().replace(" ", "_")
+    for prefix in ("文件:", "File:", "Image:"):
+        if name.lower().startswith(prefix.lower()):
+            name = name[len(prefix) :].strip()
+            break
+    if not name:
+        return ""
+    digest = hashlib.md5(name.encode("utf-8")).hexdigest()
+    return f"{PRTS_MEDIA_BASE}/{digest[0]}/{digest[:2]}/{quote(name)}"
 
 
 def _first_text(printouts: dict, key: str) -> str:
@@ -244,6 +267,7 @@ class PrtsSource(ActivitySource):
                     end_time=end_time,
                     description=full_name if full_name and full_name != name else "",
                     url=fullurl,
+                    cover=_cover_url(printouts),
                     tags=_category_names(printouts),
                     extra_times=tuple(extra_times),
                 )

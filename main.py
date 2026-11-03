@@ -222,6 +222,9 @@ class GameActivityPlugin(Star):
             game_aliases=normalize_game_aliases(
                 self._cfg("message_format", "game_aliases", "")
             ),
+            image_mode_detail_link=self._cfg_bool(
+                "message_format", "image_mode_detail_link", False
+            ),
         )
 
         # 紧急私聊提醒：进档后按间隔重复私聊，直到对方确认知晓

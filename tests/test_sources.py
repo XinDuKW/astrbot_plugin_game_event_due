@@ -18,6 +18,9 @@ from astrbot_plugin_game_event_due.sources.base import (
     parse_datetime,
     strip_html,
 )
+import hashlib
+from urllib.parse import quote
+
 from astrbot_plugin_game_event_due.sources.prts import PrtsSource, parse_smw_timestamp
 from astrbot_plugin_game_event_due.sources.registry import GameRegistry
 from astrbot_plugin_game_event_due.sources.sra import SraSource
@@ -323,6 +326,7 @@ def prts_payload() -> dict:
                         ],
                         "名称": ["SideStory「月行水上」"],
                         "名称缩短": ["月行水上"],
+                        "标题图文件名": ["活动预告 月行水上.jpg"],
                         "分类": [
                             {"fulltext": "分类:有活动信息的页面"},
                             {"fulltext": "分类:支线故事"},
@@ -370,6 +374,22 @@ async def test_prts_parse():
     assert item.tags == ("支线故事", "联动活动")
     assert item.url == "https://prts.wiki/w/月行水上"
     assert item.extra_times[0][0] == "兑换结束"
+    # 封面按 MediaWiki 的 md5 分片规则拼出（Special:FilePath 在 PRTS 上是 404）
+    digest = hashlib.md5("活动预告_月行水上.jpg".encode("utf-8")).hexdigest()
+    assert item.cover == (
+        f"https://media.prts.wiki/{digest[0]}/{digest[:2]}/"
+        + quote("活动预告_月行水上.jpg")
+    )
+
+
+@pytest.mark.anyio
+async def test_prts_without_cover_file():
+    payload = prts_payload()
+    payload["query"]["results"]["月行水上"]["printouts"]["标题图文件名"] = []
+    client = FakeClient({"action=ask": payload})
+    source = PrtsSource(client, min_request_interval_seconds=0)
+    activities = list(await source.fetch("arknights"))
+    assert activities[0].cover == ""
 
 
 @pytest.mark.anyio

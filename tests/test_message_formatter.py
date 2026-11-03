@@ -650,6 +650,37 @@ def test_display_game_name_uses_alias():
     ).startswith("🎮 崩坏：星穹铁道 · 活动提醒")
 
 
+def test_image_mode_hides_detail_link_by_default():
+    activity = make_activity(
+        "活动",
+        cover="https://example.com/a.jpg",
+        url="https://example.com/a",
+    )
+    text = build_reminder_message(
+        GAME, [make_plan(activity)], NOW, MessageSettings()
+    )
+    assert "详情：" not in text
+
+    # 显式打开开关后仍然附链接
+    text_with_link = build_reminder_message(
+        GAME,
+        [make_plan(activity)],
+        NOW,
+        MessageSettings(image_mode_detail_link=True),
+    )
+    assert "详情：https://example.com/a" in text_with_link
+
+
+def test_image_mode_keeps_detail_link_without_cover():
+    text = build_reminder_message(
+        GAME,
+        [make_plan(make_activity("活动", url="https://example.com/a"))],
+        NOW,
+        MessageSettings(),
+    )
+    assert "详情：" in text
+
+
 def test_alias_applies_to_overview_header():
     settings = MessageSettings(game_aliases=(("sr", "星铁"),))
     text = build_overview_message(GAME, [make_activity("活动")], NOW, settings)

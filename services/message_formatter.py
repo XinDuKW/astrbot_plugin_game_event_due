@@ -210,6 +210,8 @@ class MessageSettings:
     sort_by_urgency: bool = True
     # 游戏显示名覆盖：(代号/原名/内置别名 -> 想显示的名字)
     game_aliases: tuple[tuple[str, str], ...] = ()
+    # 图片模式下是否仍附「详情：链接」；默认不附，有图就别再贴链接
+    image_mode_detail_link: bool = False
 
     @property
     def cover_max_total_bytes(self) -> int:
@@ -363,7 +365,13 @@ def build_activity_block(
     if cover and settings.cover_mode == COVER_MODE_LINK:
         lines.append(f"封面：{cover}")
     if activity.url:
-        lines.append(f"详情：{activity.url}")
+        hide_detail_link = (
+            cover
+            and settings.cover_mode == COVER_MODE_IMAGE
+            and not settings.image_mode_detail_link
+        )
+        if not hide_detail_link:
+            lines.append(f"详情：{activity.url}")
 
     parts = [MessagePart(PART_TEXT, "\n".join(lines))]
     if cover and settings.cover_mode == COVER_MODE_IMAGE:
