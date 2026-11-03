@@ -389,7 +389,7 @@ python -m json.tool _conf_schema.json
 ## 致谢
 
 - [AUTO-MAS](https://github.com/AUTO-MAS-Project/AUTO-MAS) : 自动化脚本类软件的管理工具，助我更好地猛嗦铃兰、洛茜、希儿、芙宁娜、诺姆、尤诺、安魂曲玉足
-- [StarRailAssistant](https://github.com/Shasnow/StarRailAssistant) : 崩坏星穹铁道自动化助手，提供了一套免费、无需注册、无需 API 密钥的公开 REST API，助我更好地猛嗦铃兰、洛茜、希儿、芙宁娜、诺姆、尤诺、安魂曲玉足
-- [AKEData](https://github.com/nagiyume/akedatabase) : 《明日方舟：终末地》非官方数据查询与研究站，助我更好地猛嗦铃兰、洛茜、希儿、芙宁娜、诺姆、尤诺、安魂曲玉足
-- [PRTS](https://prts.wiki/) : 明日方舟爱好者搭建并协作编写的非营利wiki类资料站点，助我更好地猛嗦铃兰、洛茜、希儿、芙宁娜、诺姆、尤诺、安魂曲玉足
-- [AstrBot](https://github.com/AstrBotDevs/AstrBot): 可靠的聊天机器人，助我更好地猛嗦铃兰、洛茜、希儿、芙宁娜、诺姆、尤诺、安魂曲玉足
+- [StarRailAssistant](https://github.com/Shasnow/StarRailAssistant) : 崩坏星穹铁道自动化助手，提供了一套免费、无需注册、无需 API 密钥的公开 REST API，助我更好地猛嗦希儿、芙宁娜、诺姆、尤诺、安魂曲玉足
+- [AKEData](https://github.com/nagiyume/akedatabase) : 《明日方舟：终末地》非官方数据查询与研究站，助我更好地猛嗦洛茜玉足
+- [PRTS](https://prts.wiki/) : 明日方舟爱好者搭建并协作编写的非营利wiki类资料站点，助我更好地猛嗦铃兰玉足
+- [AstrBot](https://github.com/AstrBotDevs/AstrBot): 可靠的聊天机器人，助我更好地猛嗦玉足
