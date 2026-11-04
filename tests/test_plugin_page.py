@@ -118,3 +118,20 @@ def test_app_js_is_valid_module():
         encoding="utf-8",
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_template_editor_is_wired_to_its_endpoints():
+    """模板编辑器要真的连到后端的三个接口，页面才有内容。"""
+    html = read_html()
+    assert 'id="template-button"' in html
+    assert 'id="template-modal"' in html
+    assert 'id="template-controls"' in html
+    assert 'id="template-preview"' in html
+
+    js = (PAGE_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'apiGet("template")' in js
+    assert 'apiPost("template-preview"' in js
+    assert 'apiPost("template-save"' in js
+    # 头像走页面目录里的 logo，不能引用插件根目录（会被 page_root 限制挡住）
+    assert (PAGE_DIR / "logo.png").is_file()
+    assert './' in js and "qq-avatar" in js

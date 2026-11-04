@@ -25,11 +25,14 @@ from .cover_service import CoverResolver, select_within_budget
 from .message_formatter import (
     MessagePart,
     MessageSettings,
+    UrgentGroup,
     build_activity_block,
+    build_overview_blocks,
     build_reminder_parts,
     build_single_reminder_parts,
-    display_game_name,
+    short_game_name,
     sort_plans_by_urgency,
+    fit_forward_title,
     summarize_markers,
 )
 from .reminder_service import ReminderPlan
@@ -179,8 +182,17 @@ class ActivityDeliveryService:
         summary = summarize_markers(
             [plan.activity for plan in plans], now, settings
         )
-        base = f"🎮 {game_name} · 活动提醒"
-        return f"{base}  {summary}" if summary else base
+        compact = summary.replace(" | ", " ")
+        candidates = (
+            [
+                f"🎮 {game_name} · 活动提醒  {summary}",
+                f"{game_name} · 提醒 {compact}",
+                f"{game_name} {compact}",
+            ]
+            if summary
+            else [f"🎮 {game_name} · 活动提醒", f"{game_name} · 提醒"]
+        )
+        return fit_forward_title(candidates)
 
     @staticmethod
     def build_forward_chain(
@@ -200,6 +212,104 @@ class ActivityDeliveryService:
         if not nodes:
             return None
         return [nodes_class(nodes)]
+
+    @staticmethod
+    def build_forward_chain_named(
+        nodes: Sequence[tuple[str, Sequence[Any]]],
+    ) -> list[Any] | None:
+        """每个节点用自己的名字包成一条转发；节点不足两个时返回 None。
+
+        少于两个节点时 QQ 会显示成「xxx的聊天记录」，不如直接发普通消息。
+        """
+        node_class = getattr(Comp, "Node", None)
+        nodes_class = getattr(Comp, "Nodes", None)
+        if not (node_class and nodes_class):
+            return None
+        built = [
+            node_class(content=list(chain), name=name or NODE_NAME)
+            for name, chain in nodes
+            if chain
+        ]
+        if len(built) < 2:
+            return None
+        return [nodes_class(built)]
+
+    async def send_urgent_forward(
+        self,
+        umo: str,
+        groups: Sequence[UrgentGroup],
+        now,
+        settings: MessageSettings,
+        *,
+        title: str,
+        ack_hint: str = "",
+        node_name: str = "",
+    ) -> bool:
+        """紧急私聊提醒的合并转发：标题节点 + 每个活动一个节点。
+
+        第一个节点是「N 个活动马上就要结束了！」+ 各游戏分布（单游戏也显示），
+        之后每个活动各占一个节点，节点名是该游戏的简称。
+        """
+        if not groups:
+            return True
+        node_name = node_name or settings.forward_node_name or NODE_NAME
+        head, _, summary = title.partition("\n")
+        headline = f"{head}\n{summary}" if summary else head
+        if ack_hint:
+            headline = f"{headline}\n\n{ack_hint}"
+        nodes: list[tuple[str, Sequence[Any]]] = [
+            (node_name, self._plain_chain(headline))
+        ]
+        for group in groups:
+            for activity in group.activities:
+                block = build_activity_block(activity, (), now, settings)
+                try:
+                    items = await self.resolve_parts(block, settings)
+                except Exception as exc:
+                    logger.warning(
+                        f"封面解析失败，改为只发文字与封面链接: {exc}"
+                    )
+                    items = self._text_only(block)
+                nodes.append((group.short, self.build_chain(items)))
+
+        chain = self.build_forward_chain_named(nodes)
+        if chain is None:
+            return False
+        try:
+            await self.context.send_message(umo, MessageChain(chain=chain))
+            return True
+        except Exception as exc:
+            logger.warning(f"活动私聊提醒发送失败 {umo}: {exc}")
+            return False
+
+    async def build_overview_forward_chain(
+        self,
+        game: Any,
+        activities: Sequence[Any],
+        now: Any,
+        settings: MessageSettings,
+        *,
+        source_name: str = "",
+    ) -> list[Any] | None:
+        """「当前活动一览」的转发链：标题节点 + 每个活动一个节点。
+
+        节点名统一用游戏简称，点开后逐条都是完整活动（含封面）。
+        """
+        header, blocks = build_overview_blocks(
+            game, activities, now, settings, source_name=source_name
+        )
+        node_name = short_game_name(game, settings)
+        nodes: list[tuple[str, Sequence[Any]]] = [
+            (node_name, self._plain_chain(header))
+        ]
+        for block in blocks:
+            try:
+                items = await self.resolve_parts(block, settings)
+            except Exception as exc:
+                logger.warning(f"封面解析失败，改为只发文字与封面链接: {exc}")
+                items = self._text_only(block)
+            nodes.append((node_name, self.build_chain(items)))
+        return self.build_forward_chain_named(nodes)
 
     async def build_event_chain(
         self,
@@ -382,13 +492,13 @@ class ActivityDeliveryService:
         if effective.use_forward_node:
             ordered = self._ordered_plans(plans, now, effective)
             chains = await self._build_forward_nodes(ordered, now, effective)
-            node_name = display_game_name(game, effective)
+            node_name = short_game_name(game, effective)
             title = self._forward_title(node_name, ordered, now, effective)
             nodes = [self._plain_chain(title)] + chains
             if await self._send_as_forward_nodes(umo, nodes, node_name):
                 return list(plans)
 
-        node_name = display_game_name(game, effective)
+        node_name = short_game_name(game, effective)
         title = self._forward_title(node_name, plans, now, effective)
         if effective.single_message_per_game:
             parts = build_reminder_parts(game, plans, now, effective)

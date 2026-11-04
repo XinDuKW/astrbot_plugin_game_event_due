@@ -12,22 +12,34 @@ from astrbot_plugin_game_event_due.services.message_formatter import (
     COVER_MODE_LINK,
     COVER_MODE_OFF,
     DEFAULT_ACTIVITY_SEPARATOR,
+    DEFAULT_GAME_SHORT_NAMES,
     DEFAULT_URGENCY_LEVELS,
     DEFAULT_URGENCY_RULES,
     PART_IMAGE,
     PART_TEXT,
     MessagePart,
     MessageSettings,
+    build_overview_blocks,
     build_overview_message,
     build_overview_parts,
     build_reminder_message,
     build_reminder_parts,
     build_single_reminder_message,
     build_single_reminder_parts,
+    build_urgent_dm_body_parts,
+    build_urgent_dm_groups,
+    build_urgent_dm_headline,
+    build_urgent_dm_parts,
+    build_urgent_dm_summary,
+    build_urgent_dm_title,
+    build_template_preview,
+    format_game_pairs,
+    format_urgency_rules,
     normalize_cover_mode,
     normalize_game_aliases,
     parse_urgency_rules,
     parts_to_text,
+    short_game_name,
     truncate,
     urgency_level_for,
 )
@@ -202,8 +214,8 @@ def test_overview_groups_active_and_upcoming():
     text = build_overview_message(GAME, activities, NOW, SETTINGS, source_name="SRA 公共 API")
 
     assert "🎮 崩坏：星穹铁道 · 当前活动" in text
-    assert "▎进行中（1）" in text
-    assert "▎即将开始（1）" in text
+    assert re.search(r"▎进行中（.{0,8}1）", text)
+    assert re.search(r"▎即将开始（.{0,8}1）", text)
     assert "（数据来源：SRA 公共 API）" in text
     assert text.index("进行中") < text.index("即将开始")
 
@@ -372,9 +384,13 @@ def test_overview_parts_carry_images_and_section_titles():
     text = parts_to_text(parts)
     # 分段标题必须紧挨着它自己那一批活动，不能被挤到消息开头
     # （活动标题前会带剩余时间标记，这里用正则跳过它）
-    assert re.search(r"▎进行中（1）\n\n\S+ 进行中", text)
-    assert re.search(r"▎即将开始（1）\n\n\S+ 即将开始", text)
-    assert text.index("▎进行中（1）") < text.index("▎即将开始（1）") < text.index("（数据来源：SRA）")
+    assert re.search(r"▎进行中（.{0,8}1）\n\n\S+ 进行中", text)
+    assert re.search(r"▎即将开始（.{0,8}1）\n\n\S+ 即将开始", text)
+    assert (
+        text.index("▎进行中")
+        < text.index("▎即将开始")
+        < text.index("（数据来源：SRA）")
+    )
 
 
 def test_overview_parts_without_source_name():
@@ -508,8 +524,8 @@ def test_separator_not_inserted_after_section_heading():
     text = parts_to_text(parts)
 
     # 分段标题紧跟它自己的第一个活动，不能被分隔线割开
-    assert re.search(r"▎进行中（2）\n\n\S+ 进行中1", text)
-    assert re.search(r"▎即将开始（1）\n\n\S+ 即将开始1", text)
+    assert re.search(r"▎进行中（.{0,8}2）\n\n\S+ 进行中1", text)
+    assert re.search(r"▎即将开始（.{0,8}1）\n\n\S+ 即将开始1", text)
     # 只有「进行中1 / 进行中2」这一处插入分隔线
     assert text.count(DEFAULT_ACTIVITY_SEPARATOR) == 1
     assert re.search(
@@ -577,7 +593,7 @@ def test_header_carries_tier_summary():
         make_plan(make_activity("缓", activity_id="b", end=timedelta(days=6))),
     ]
     text = build_reminder_message(GAME, plans, NOW, SETTINGS)
-    assert "🟥1 🟩1" in text
+    assert "🟥1 | 🟩1" in text
 
 
 def test_tier_summary_can_be_disabled():
@@ -685,3 +701,222 @@ def test_alias_applies_to_overview_header():
     settings = MessageSettings(game_aliases=(("sr", "星铁"),))
     text = build_overview_message(GAME, [make_activity("活动")], NOW, settings)
     assert text.startswith("🎮 星铁 · 当前活动")
+
+
+# ---- 游戏简称与紧急提醒分组 ----
+
+GAMES_BY_ID = {game.game_id: game for game in SRA_GAMES}
+
+
+def make_game_activity(
+    game_id: str, name: str, *, hours: int, activity_id: str = ""
+) -> Activity:
+    return Activity(
+        game_id=game_id,
+        activity_id=activity_id or f"{game_id}-{name}",
+        name=name,
+        start_time=NOW - timedelta(days=1),
+        end_time=NOW + timedelta(hours=hours),
+    )
+
+
+def test_short_game_name_uses_builtin_defaults():
+    assert DEFAULT_GAME_SHORT_NAMES
+    assert short_game_name(GAME, SETTINGS) == "铁"
+    assert short_game_name(GAMES_BY_ID["ys"], SETTINGS) == "原"
+
+
+def test_short_game_name_can_be_disabled_and_overridden():
+    off = MessageSettings(use_short_names=False)
+    assert short_game_name(GAME, off) == GAME.name
+    custom = MessageSettings(game_short_names=(("sr", "崩"),))
+    assert short_game_name(GAME, custom) == "崩"
+    # 没配简称的游戏退回显示名
+    assert short_game_name(GAMES_BY_ID["ys"], custom) == "原神"
+
+
+def test_urgent_groups_split_by_game_with_most_urgent_first():
+    activities = [
+        make_game_activity("ys", "原神活动", hours=30),
+        make_game_activity("sr", "星铁慢", hours=20),
+        make_game_activity("sr", "星铁急", hours=5),
+    ]
+    groups = build_urgent_dm_groups(
+        activities, NOW, SETTINGS, games=GAMES_BY_ID
+    )
+    assert [group.game_id for group in groups] == ["sr", "ys"]
+    assert [a.name for a in groups[0].activities] == ["星铁急", "星铁慢"]
+    assert groups[0].short == "铁"
+
+
+def test_urgent_title_lists_per_game_counts():
+    activities = [
+        make_game_activity("sr", "A", hours=5),
+        make_game_activity("sr", "B", hours=20),
+        make_game_activity("ys", "C", hours=40),
+    ]
+    groups = build_urgent_dm_groups(
+        activities, NOW, SETTINGS, games=GAMES_BY_ID
+    )
+    title = build_urgent_dm_title(groups, SETTINGS)
+    assert title.startswith("🚨 3 个活动马上就要结束了！")
+    assert "铁:2" in title and "原:1" in title
+
+
+def test_urgent_parts_separate_games():
+    activities = [
+        make_game_activity("sr", "A", hours=5),
+        make_game_activity("ys", "C", hours=40),
+    ]
+    text = parts_to_text(
+        build_urgent_dm_parts(activities, NOW, SETTINGS, games=GAMES_BY_ID)
+    )
+    assert "===========" in text
+    assert "🎮 崩坏：星穹铁道（1 个）" in text
+    assert "🎮 原神（1 个）" in text
+
+
+def test_urgent_parts_without_registry_fall_back_to_ids():
+    activities = [make_game_activity("zzz", "活动", hours=3)]
+    text = parts_to_text(build_urgent_dm_parts(activities, NOW, SETTINGS))
+    assert "🎮 zzz（1 个）" in text
+
+def test_urgent_headline_and_summary_stay_separate_for_forward_nodes():
+    activities = [
+        make_game_activity("sr", "A", hours=5),
+        make_game_activity("ys", "C", hours=40),
+    ]
+    groups = build_urgent_dm_groups(activities, NOW, SETTINGS, games=GAMES_BY_ID)
+    assert build_urgent_dm_headline(groups) == "🚨 2 个活动马上就要结束了！"
+    assert build_urgent_dm_summary(groups) == "铁:1 | 原:1"
+    assert build_urgent_dm_title(groups, SETTINGS) == (
+        "🚨 2 个活动马上就要结束了！\n🚨 铁:1 | 原:1"
+    )
+
+
+def test_urgent_summary_lists_every_game_even_single():
+    activities = [make_game_activity("sr", "A", hours=5)]
+    groups = build_urgent_dm_groups(activities, NOW, SETTINGS, games=GAMES_BY_ID)
+    assert build_urgent_dm_summary(groups) == "铁:1"
+    assert build_urgent_dm_title(groups, SETTINGS).endswith("\n🚨 铁:1")
+
+
+def test_urgent_body_starts_with_summary_and_has_no_leading_blank():
+    activities = [
+        make_game_activity("sr", "A", hours=5),
+        make_game_activity("ys", "C", hours=40),
+    ]
+    groups = build_urgent_dm_groups(activities, NOW, SETTINGS, games=GAMES_BY_ID)
+    # 转发时正文首行取自标题第二行（带 🚨），与 delivery_service 保持一致
+    headline = build_urgent_dm_title(groups, SETTINGS).partition("\n")[2]
+    text = parts_to_text(
+        build_urgent_dm_body_parts(groups, NOW, SETTINGS, headline=headline)
+    )
+    assert not text.startswith("\n")
+    assert text.split("\n")[0] == "🚨 铁:1 | 原:1"
+    assert "🎮 崩坏：星穹铁道（1 个）" in text
+
+
+def test_urgent_body_without_headline_has_no_leading_blank():
+    activities = [make_game_activity("zzz", "活动", hours=3)]
+    groups = build_urgent_dm_groups(activities, NOW, SETTINGS, games=GAMES_BY_ID)
+    text = parts_to_text(build_urgent_dm_body_parts(groups, NOW, SETTINGS))
+    assert text.startswith("🎮 ")
+
+def test_overview_blocks_split_per_activity():
+    activities = [
+        make_activity("进行中", activity_id="a"),
+        make_activity(
+            "即将开始",
+            activity_id="b",
+            start=timedelta(days=5),
+            end=timedelta(days=20),
+        ),
+    ]
+    header, blocks = build_overview_blocks(
+        GAME, activities, NOW, SETTINGS, source_name="SRA"
+    )
+
+    # 标题自带档位统计，不点开也知道有几条；放得下才带「▎进行中」字样
+    assert "🟩1" in header
+    assert header.startswith("🎮 崩坏：星穹铁道 · 当前活动")
+    # 每个活动一个节点，最后一条是数据来源
+    assert len(blocks) == 3
+    assert parts_to_text(blocks[0]).startswith("🟩 进行中")
+    assert parts_to_text(blocks[-1]) == "（数据来源：SRA）"
+
+
+def test_overview_blocks_without_activities_explains_empty():
+    header, blocks = build_overview_blocks(GAME, [], NOW, SETTINGS)
+    assert header == "🎮 崩坏：星穹铁道 · 当前活动"
+    assert len(blocks) == 1
+    assert "没有进行中" in parts_to_text(blocks[0])
+
+
+def test_urgent_forward_node_name_defaults_to_reminder():
+    assert SETTINGS.forward_node_name == "活动提醒"
+    assert MessageSettings(forward_node_name="催一下").forward_node_name == "催一下"
+
+
+def test_format_game_pairs_and_urgency_rules_roundtrip():
+    assert format_game_pairs((("sr", "铁"), ("ys", "原"))) == "sr=铁\nys=原"
+    assert format_game_pairs(()) == ""
+    assert format_urgency_rules(DEFAULT_URGENCY_LEVELS) == DEFAULT_URGENCY_RULES
+    assert (
+        parse_urgency_rules(format_urgency_rules(DEFAULT_URGENCY_LEVELS))
+        == DEFAULT_URGENCY_LEVELS
+    )
+
+
+def test_template_preview_covers_both_delivery_forms():
+    activities = [
+        make_activity("活动甲", activity_id="a", end=timedelta(hours=5)),
+        make_activity("活动乙", activity_id="b", end=timedelta(days=2)),
+    ]
+    preview = build_template_preview(GAME, activities, NOW, SETTINGS, source_name="SRA")
+
+    assert preview["sender"]["name"] == "游戏活动日历"
+    assert preview["sender"]["avatar"] == "logo.png"
+    assert preview["plain"]["header"].startswith("🎮 崩坏：星穹铁道 · 当前活动")
+    assert preview["plain"]["sections"][0]["kind"] == "heading"
+    # 标题节点 + 每个活动一个节点
+    assert len(preview["forward"]["nodes"]) == 2
+    assert preview["forward"]["card_title"] == "群聊的聊天记录"
+    assert preview["forward"]["footer"] == "查看 3 条转发消息"
+
+
+def test_template_preview_separator_only_between_activities():
+    activities = [
+        make_activity("甲", activity_id="a", end=timedelta(hours=5)),
+        make_activity("乙", activity_id="b", end=timedelta(days=2)),
+        make_activity("丙", activity_id="c", end=timedelta(days=6)),
+    ]
+    preview = build_template_preview(GAME, activities, NOW, SETTINGS)
+    kinds = [section["kind"] for section in preview["plain"]["sections"]]
+    assert kinds == [
+        "heading",
+        "activity",
+        "separator",
+        "activity",
+        "separator",
+        "activity",
+    ]
+
+
+def test_template_preview_uses_short_names_for_nodes():
+    activities = [make_activity("甲", activity_id="a")]
+    preview = build_template_preview(GAME, activities, NOW, SETTINGS)
+    assert preview["short_name"] == "铁"
+    assert preview["forward"]["nodes"][0]["name"] == "铁"
+
+    full = build_template_preview(
+        GAME, activities, NOW, MessageSettings(use_short_names=False)
+    )
+    assert full["forward"]["nodes"][0]["name"] == "崩坏：星穹铁道"
+
+
+def test_template_preview_without_activities_explains_empty():
+    preview = build_template_preview(GAME, [], NOW, SETTINGS)
+    assert [section["kind"] for section in preview["plain"]["sections"]] == ["note"]
+    assert preview["forward"]["nodes"] == []
+    assert preview["forward"]["footer"] == "查看 1 条转发消息"

@@ -441,6 +441,477 @@ async function runCycle() {
   }
 }
 
+// ---- 消息模板编辑器 ----
+//
+// 后端只会给出「结构化预览」：标题、分段标题、分隔线、活动块，以及合并转发里
+// 每个节点的名字与首行。这里只负责把它画成 QQ 的样子，不参与文案拼装，
+// 所以页面上看到的就是真正会发出去的那条消息。
+
+const TEMPLATE_FIELDS = [
+  {
+    group: "基础",
+    items: [
+      {
+        key: "use_forward_node",
+        label: "使用合并转发",
+        hint: "关闭后按游戏合并成一条普通消息；开启后每个活动一个转发节点。",
+        type: "switch",
+      },
+      {
+        key: "forward_node_name",
+        label: "转发节点名",
+        hint: "普通消息模式下这条消息的显示名，建议 4 字以内。",
+        type: "text",
+        placeholder: "活动提醒",
+      },
+      {
+        key: "cover_mode",
+        label: "封面形式",
+        hint: "",
+        type: "select",
+      },
+      {
+        key: "image_mode_detail_link",
+        label: "图片模式也附详情链接",
+        hint: "开启后即使已经发了封面图，也会再补一行详情链接。",
+        type: "switch",
+      },
+    ],
+  },
+  {
+    group: "倒计时标记",
+    items: [
+      {
+        key: "urgency_marker",
+        label: "显示颜色方块",
+        hint: "每个活动标题前的方块，颜色表示剩余时间档位。",
+        type: "switch",
+      },
+      {
+        key: "urgency_rules",
+        label: "档位与颜色",
+        hint: "写成 天数:颜色，用逗号分隔；* 表示兜底档，颜色可写 emoji 或红/橙/绿/蓝。",
+        type: "text",
+        placeholder: "1:🟥,3:🟧,7:🟩,*:🟦",
+      },
+      {
+        key: "tier_summary",
+        label: "分段标题带档位统计",
+        hint: "例如 ▎进行中（🟦5 | 🟩1）。",
+        type: "switch",
+      },
+      {
+        key: "headline_remaining",
+        label: "标题里写剩余时间",
+        hint: "把「剩余 3 天 4 小时」贴在活动名后面，避免一眼看不到。",
+        type: "switch",
+      },
+      {
+        key: "sort_by_urgency",
+        label: "按紧急度排序",
+        hint: "剩余时间少的排在前面。",
+        type: "switch",
+      },
+    ],
+  },
+  {
+    group: "正文内容",
+    items: [
+      {
+        key: "include_description",
+        label: "包含活动说明",
+        hint: "过长的说明会被截断。",
+        type: "switch",
+      },
+      {
+        key: "include_tags",
+        label: "包含标签",
+        hint: "",
+        type: "switch",
+      },
+      {
+        key: "include_extra_times",
+        label: "包含兑换结束时间",
+        hint: "",
+        type: "switch",
+      },
+      {
+        key: "activity_separator",
+        label: "活动之间的分隔线",
+        hint: "留空则不加分隔线。",
+        type: "text",
+        placeholder: "━━━━━━━━━━━━",
+      },
+    ],
+  },
+  {
+    group: "游戏显示名",
+    items: [
+      {
+        key: "use_short_names",
+        label: "转发节点用简称",
+        hint: "关掉后节点名用完整游戏名。",
+        type: "switch",
+      },
+      {
+        key: "game_short_names",
+        label: "游戏简称",
+        hint: "每行一个，写成 代号=简称，例如 ys=原。",
+        type: "textarea",
+        rows: 4,
+      },
+      {
+        key: "game_aliases",
+        label: "游戏别名",
+        hint: "每行一个，写成 代号=显示名，命令里可直接用这个叫法。",
+        type: "textarea",
+        rows: 4,
+      },
+    ],
+  },
+];
+
+const templateState = {
+  values: null,
+  initial: null,
+  preview: null,
+  games: [],
+  coverModes: ["image", "link", "off"],
+  gameId: "",
+  timer: null,
+};
+
+templateState.elements = {
+  button: document.getElementById("template-button"),
+  modal: document.getElementById("template-modal"),
+  close: document.getElementById("template-close"),
+  controls: document.getElementById("template-controls"),
+  preview: document.getElementById("template-preview"),
+  note: document.getElementById("template-note"),
+  reset: document.getElementById("template-reset"),
+  save: document.getElementById("template-save"),
+};
+
+function setTemplateNote(message = "", isError = false) {
+  templateState.elements.note.textContent = message;
+  templateState.elements.note.classList.toggle("is-error", isError);
+}
+
+function renderField(item) {
+  const value = templateState.values ? templateState.values[item.key] : "";
+  if (item.type === "switch") {
+    const checked = value ? " checked" : "";
+    return [
+      '<label class="toggle tmpl-toggle">',
+      '  <input type="checkbox" data-tmpl-field="' + item.key + '"' + checked + " />",
+      '  <span class="tmpl-toggle-text">',
+      "    <strong>" + escapeHtml(item.label) + "</strong>",
+      item.hint
+        ? '    <span class="field-hint">' + escapeHtml(item.hint) + "</span>"
+        : "",
+      "  </span>",
+      "</label>",
+    ].join("");
+  }
+  if (item.type === "select") {
+    const options = (item.options || templateState.coverModes)
+      .map((option) => {
+        const optionValue = typeof option === "string" ? option : option.value;
+        const optionLabel =
+          typeof option === "string"
+            ? COVER_LABELS[option] || option
+            : option.label;
+        const selected = String(value) === String(optionValue) ? " selected" : "";
+        return (
+          '<option value="' + escapeHtml(optionValue) + '"' + selected + ">" +
+          escapeHtml(optionLabel) +
+          "</option>"
+        );
+      })
+      .join("");
+    return [
+      '<div class="field-group">',
+      '  <label class="field-label">' + escapeHtml(item.label) + "</label>",
+      '  <select data-tmpl-field="' + item.key + '">' + options + "</select>",
+      item.hint
+        ? '  <span class="field-hint">' + escapeHtml(item.hint) + "</span>"
+        : "",
+      "</div>",
+    ].join("");
+  }
+  if (item.type === "textarea") {
+    return [
+      '<div class="field-group">',
+      '  <label class="field-label">' + escapeHtml(item.label) + "</label>",
+      '  <textarea data-tmpl-field="' + item.key + '" rows="' + (item.rows || 3) + '">' +
+      escapeHtml(value) +
+      "</textarea>",
+      item.hint
+        ? '  <span class="field-hint">' + escapeHtml(item.hint) + "</span>"
+        : "",
+      "</div>",
+    ].join("");
+  }
+  return [
+    '<div class="field-group">',
+    '  <label class="field-label">' + escapeHtml(item.label) + "</label>",
+    '  <input type="text" data-tmpl-field="' + item.key + '" value="' +
+    escapeHtml(value) +
+    '" placeholder="' + escapeHtml(item.placeholder || "") + '" />',
+    item.hint
+      ? '  <span class="field-hint">' + escapeHtml(item.hint) + "</span>"
+      : "",
+    "</div>",
+  ].join("");
+}
+
+function renderTemplateControls() {
+  const gameOptions = [
+    '<option value="">示例活动（离线）</option>',
+  ]
+    .concat(
+      templateState.games.map(
+        (game) =>
+          '<option value="' + escapeHtml(game.game_id) + '"' +
+          (templateState.gameId === game.game_id ? " selected" : "") +
+          ">" +
+          escapeHtml(game.name) +
+          "</option>",
+      ),
+    )
+    .join("");
+  const gameField = [
+    '<div class="field-group tmpl-game-field">',
+    '  <label class="field-label" for="tmpl-game">预览数据</label>',
+    '  <select id="tmpl-game">' + gameOptions + "</select>",
+    '  <span class="field-hint">选具体游戏会去拉真实活动；默认用内置示例，四档颜色都能看到。</span>',
+    "</div>",
+  ].join("");
+  const sections = TEMPLATE_FIELDS.map((section) =>
+    [
+      '<section class="tmpl-group">',
+      '  <h3 class="tmpl-group-title">' + escapeHtml(section.group) + "</h3>",
+      section.items.map(renderField).join(""),
+      "</section>",
+    ].join(""),
+  ).join("");
+  templateState.elements.controls.innerHTML = gameField + sections;
+  bindTemplateInputs();
+}
+
+function bindTemplateInputs() {
+  templateState.elements.controls
+    .querySelectorAll("[data-tmpl-field]")
+    .forEach((node) => {
+      const eventName = node.type === "checkbox" || node.tagName === "SELECT"
+        ? "change"
+        : "input";
+      node.addEventListener(eventName, scheduleTemplatePreview);
+    });
+  const gameSelect = document.getElementById("tmpl-game");
+  if (gameSelect) {
+    gameSelect.addEventListener("change", () => {
+      templateState.gameId = gameSelect.value;
+      refreshTemplatePreview();
+    });
+  }
+}
+
+function collectTemplateValues() {
+  const values = { ...(templateState.values || {}) };
+  templateState.elements.controls
+    .querySelectorAll("[data-tmpl-field]")
+    .forEach((node) => {
+      const key = node.dataset.tmplField;
+      if (!key) return;
+      values[key] = node.type === "checkbox" ? node.checked : node.value;
+    });
+  return values;
+}
+
+function scheduleTemplatePreview() {
+  window.clearTimeout(templateState.timer);
+  templateState.timer = window.setTimeout(() => {
+    templateState.values = collectTemplateValues();
+    refreshTemplatePreview();
+  }, 300);
+}
+
+async function refreshTemplatePreview() {
+  if (!bridge) return;
+  if (!templateState.values) templateState.values = collectTemplateValues();
+  templateState.elements.preview.classList.add("is-loading");
+  try {
+    const preview = await bridge.apiPost("template-preview", {
+      values: templateState.values,
+      game_id: templateState.gameId || "",
+    });
+    templateState.preview = preview;
+    renderTemplatePreview(preview);
+    setTemplateNote(preview && preview.note ? preview.note : "");
+  } catch (error) {
+    setTemplateNote(error && error.message ? error.message : "预览失败", true);
+  } finally {
+    templateState.elements.preview.classList.remove("is-loading");
+  }
+}
+
+function renderMessageFrame(preview, bodyHtml) {
+  const sender = (preview && preview.sender) || {};
+  const avatar = sender.avatar || "logo.png";
+  const name = sender.name || "游戏活动日历";
+  return [
+    '<div class="qq-message">',
+    '  <img class="qq-avatar" src="./' + escapeHtml(avatar) + '" alt="" />',
+    '  <div class="qq-message-main">',
+    '    <div class="qq-sender-name">' + escapeHtml(name) + '</div>',
+    bodyHtml,
+    '  </div>',
+    '</div>',
+  ].join("");
+}
+
+function renderPlainSection(section) {
+  if (section.kind === "heading") {
+    return '<div class="qq-heading">' + escapeHtml(section.text) + "</div>";
+  }
+  if (section.kind === "separator") {
+    return '<div class="qq-separator">' + escapeHtml(section.text) + "</div>";
+  }
+  if (section.kind === "note") {
+    return '<div class="qq-note">' + escapeHtml(section.text) + "</div>";
+  }
+  const lines = (section.lines || [])
+    .map((line) => '<div class="qq-line">' + escapeHtml(line) + "</div>")
+    .join("");
+  const image = section.image
+    ? '<img class="qq-cover" src="' + escapeHtml(section.image) + '" alt="" />'
+    : "";
+  return '<div class="qq-activity">' + lines + image + "</div>";
+}
+
+function renderPlainBubble(preview) {
+  const plain = (preview && preview.plain) || {};
+  const body = (plain.sections || []).map(renderPlainSection).join("");
+  const bubble = [
+    '<div class="qq-bubble">',
+    '  <div class="qq-bubble-title">' + escapeHtml(plain.header || "") + "</div>",
+    body,
+    "</div>",
+  ].join("");
+  return renderMessageFrame(preview, bubble);
+}
+
+function renderForwardBubble(preview) {
+  const forward = (preview && preview.forward) || {};
+  const nodes = [];
+  if (forward.title_node) nodes.push(forward.title_node);
+  (forward.nodes || []).forEach((node) => nodes.push(node));
+  const rows = nodes
+    .map((node) => {
+      const firstLine = (node.lines || [])[0] || "";
+      return [
+        '<li class="qq-forward-row">',
+        '  <span class="qq-forward-name">' + escapeHtml(node.name || "") + "</span>",
+        '  <span class="qq-forward-text">' + escapeHtml(firstLine) + "</span>",
+        "</li>",
+      ].join("");
+    })
+    .join("");
+  const card = [
+    '<div class="qq-forward-card">',
+    '  <div class="qq-forward-title">' +
+      escapeHtml(forward.card_title || "群聊的聊天记录") +
+      "</div>",
+    '  <ul class="qq-forward-list">' + rows + "</ul>",
+    '  <div class="qq-forward-foot">' + escapeHtml(forward.footer || "") + "</div>",
+    "</div>",
+  ].join("");
+  return renderMessageFrame(preview, card);
+}
+
+function renderTemplatePreview(preview) {
+  templateState.elements.preview.innerHTML = [
+    '<div class="tmpl-pane">',
+    '  <div class="tmpl-pane-title">普通消息</div>',
+    renderPlainBubble(preview),
+    "</div>",
+    '<div class="tmpl-pane">',
+    '  <div class="tmpl-pane-title">合并转发</div>',
+    renderForwardBubble(preview),
+    "</div>",
+  ].join("");
+}
+
+function applyTemplateValues(values) {
+  templateState.values = { ...values };
+  renderTemplateControls();
+}
+
+async function openTemplate() {
+  if (!bridge) {
+    bridgeMissing();
+    return;
+  }
+  templateState.elements.modal.classList.remove("is-hidden");
+  if (templateState.values) {
+    renderTemplateControls();
+    return;
+  }
+  setTemplateNote("正在读取当前模板…");
+  try {
+    const data = await bridge.apiGet("template");
+    templateState.values = (data && data.values) || {};
+    templateState.initial = { ...templateState.values };
+    templateState.games = (data && data.games) || [];
+    templateState.coverModes =
+      (data && data.cover_modes) || ["image", "link", "off"];
+    templateState.gameId = "";
+    renderTemplateControls();
+    await refreshTemplatePreview();
+  } catch (error) {
+    setTemplateNote(error && error.message ? error.message : "读取模板失败", true);
+  }
+}
+
+function closeTemplate() {
+  templateState.elements.modal.classList.add("is-hidden");
+}
+
+function resetTemplate() {
+  if (!templateState.initial) return;
+  applyTemplateValues(templateState.initial);
+  refreshTemplatePreview();
+  showToast("已还原为保存前的设置");
+}
+
+async function saveTemplate() {
+  if (!bridge) return;
+  const values = collectTemplateValues();
+  templateState.values = values;
+  templateState.elements.save.classList.add("is-loading");
+  try {
+    const result = await bridge.apiPost("template-save", { values });
+    templateState.values = (result && result.values) || values;
+    templateState.initial = { ...templateState.values };
+    renderTemplateControls();
+    showToast("模板已保存，下一条推送就按这个样式");
+    await refreshTemplatePreview();
+  } catch (error) {
+    showToast(error && error.message ? error.message : "保存失败", true);
+  } finally {
+    templateState.elements.save.classList.remove("is-loading");
+  }
+}
+
+templateState.elements.button.addEventListener("click", openTemplate);
+templateState.elements.close.addEventListener("click", closeTemplate);
+templateState.elements.reset.addEventListener("click", resetTemplate);
+templateState.elements.save.addEventListener("click", saveTemplate);
+templateState.elements.modal.addEventListener("click", (event) => {
+  if (event.target === templateState.elements.modal) closeTemplate();
+});
+
 elements.refreshButton.addEventListener("click", () =>
   loadOverview({ announce: true }),
 );

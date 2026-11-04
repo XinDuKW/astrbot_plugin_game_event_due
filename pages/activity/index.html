@@ -17,6 +17,9 @@
           </div>
         </div>
         <div class="topbar-actions">
+          <button class="ghost-button" id="template-button" type="button">
+            消息模板
+          </button>
           <button class="ghost-button" id="cycle-button" type="button">
             立即检查
           </button>
@@ -72,6 +75,49 @@
           <ul class="session-list" id="session-list"></ul>
         </aside>
         <main class="detail-pane" id="detail-view"></main>
+      </div>
+    </div>
+
+    <div
+      class="modal is-hidden"
+      id="template-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-label="消息模板编辑器"
+    >
+      <div class="modal-panel">
+        <header class="modal-head">
+          <div>
+            <h2>消息模板编辑器</h2>
+            <p class="modal-sub">
+              左边改设置，右边按 QQ 的样子即时预览；保存后立即生效。
+            </p>
+          </div>
+          <button
+            class="icon-button"
+            id="template-close"
+            type="button"
+            title="关闭"
+            aria-label="关闭"
+          >
+            ×
+          </button>
+        </header>
+        <div class="modal-body">
+          <div class="template-controls" id="template-controls"></div>
+          <div class="template-preview" id="template-preview"></div>
+        </div>
+        <footer class="modal-foot">
+          <span class="field-hint" id="template-note"></span>
+          <div class="detail-actions">
+            <button class="ghost-button" id="template-reset" type="button">
+              还原修改
+            </button>
+            <button class="primary-button" id="template-save" type="button">
+              保存模板
+            </button>
+          </div>
+        </footer>
       </div>
     </div>
 

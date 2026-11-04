@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from typing import Any
 from collections.abc import Sequence
@@ -17,8 +17,11 @@ from .delivery_service import ActivityDeliveryService
 from .message_formatter import (
     MessageSettings,
     build_overview_parts,
+    build_urgent_dm_groups,
     build_urgent_dm_parts,
-    display_game_name,
+    build_urgent_dm_title,
+    build_overview_title,
+    short_game_name,
 )
 from .reminder_service import (
     ActivityNotifyState,
@@ -383,24 +386,38 @@ class ActivityPollingService:
             if not pending:
                 continue
 
-            parts = build_urgent_dm_parts(
+            groups = build_urgent_dm_groups(
                 pending,
                 now,
                 self.message_settings,
-                ack_hint=self._urgent_ack_hint(),
+                games=self.registry.games,
             )
-            node_name = "活动提醒"
-            if len({activity.game_id for activity in pending}) == 1:
-                game = self.registry.games.get(pending[0].game_id)
-                if game is not None:
-                    node_name = display_game_name(game, self.message_settings)
-            if not await self.delivery.send_parts(
-                umo,
-                parts,
-                self.message_settings,
-                node_name=node_name,
-                forward_title="🚨 活动马上就要结束了！",
-            ):
+            ack_hint = self._urgent_ack_hint()
+            sent = False
+            if self.message_settings.use_forward_node:
+                sent = await self.delivery.send_urgent_forward(
+                    umo,
+                    groups,
+                    now,
+                    self.message_settings,
+                    title=build_urgent_dm_title(groups, self.message_settings),
+                    ack_hint=ack_hint,
+                )
+            if not sent:
+                parts = build_urgent_dm_parts(
+                    pending,
+                    now,
+                    self.message_settings,
+                    ack_hint=ack_hint,
+                    games=self.registry.games,
+                )
+                sent = await self.delivery.send_parts(
+                    umo,
+                    parts,
+                    replace(self.message_settings, use_forward_node=False),
+                    node_name=self.message_settings.forward_node_name,
+                )
+            if not sent:
                 continue
 
             report.messages += 1
@@ -461,9 +478,9 @@ class ActivityPollingService:
                 umo,
                 parts,
                 settings,
-                node_name=display_game_name(game, settings),
-                forward_title=(
-                    f"🎮 {display_game_name(game, settings)} · 当前活动"
+                node_name=short_game_name(game, settings),
+                forward_title=build_overview_title(
+                    game, activities, now, settings
                 ),
             ):
                 sent += 1

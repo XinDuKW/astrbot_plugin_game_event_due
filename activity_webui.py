@@ -3,19 +3,30 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime
+from dataclasses import replace
+from datetime import datetime, timedelta
 from typing import Any
 
 from astrbot.api import logger
 from astrbot.api.web import error_response, json_response, request
 
-from .services.message_formatter import COVER_MODES, build_overview_message
+from .services.message_formatter import (
+    COVER_MODES,
+    DEFAULT_FORWARD_NODE_NAME,
+    build_overview_message,
+    build_template_preview,
+    format_game_pairs,
+    format_urgency_rules,
+    normalize_game_aliases,
+    normalize_game_short_names,
+    parse_urgency_rules,
+)
 from .services.reminder_service import normalize_keywords, normalize_thresholds
 from .services.subscription_service import (
     resolve_message_settings,
     resolve_policy,
 )
-from .sources import GAME_TIMEZONE
+from .sources import GAME_TIMEZONE, Activity, Game
 
 PLUGIN_NAME = "astrbot_plugin_game_event_due"
 MESSAGE_TYPES = {"GroupMessage", "FriendMessage", "OtherMessage"}
@@ -37,6 +48,9 @@ class ActivityWebUIController:
             ("session/update", self.update_session, ["POST"], "修改活动订阅设置"),
             ("session/remove", self.remove_session, ["POST"], "移除活动订阅"),
             ("preview", self.preview, ["POST"], "预览某个游戏的当前活动"),
+            ("template", self.template, ["GET"], "读取消息模板配置"),
+            ("template-preview", self.template_preview, ["POST"], "按草稿模板预览排版"),
+            ("template-save", self.template_save, ["POST"], "保存消息模板配置"),
             ("refresh", self.refresh, ["POST"], "立即执行一轮活动检查"),
         )
         for endpoint, handler, methods, description in routes:
@@ -392,3 +406,254 @@ class ActivityWebUIController:
                 "failures": dict(report.failures),
             }
         )
+
+    # ---- 消息模板编辑器 ----
+
+    @staticmethod
+    def _read_bool(values: dict, key: str, default: bool) -> bool:
+        if key not in values:
+            return default
+        value = values[key]
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _read_text(values: dict, key: str, default: str) -> str:
+        if key not in values:
+            return default
+        return str(values[key] if values[key] is not None else "").strip()
+
+    def _draft_settings(self, values: Any):
+        """把页面提交的模板值套到当前设置上，得到一个用于预览的草稿。"""
+        base = self.plugin.message_settings
+        if not isinstance(values, dict) or not values:
+            return base
+
+        cover_mode = base.cover_mode
+        if "cover_mode" in values:
+            raw = str(values.get("cover_mode") or "").strip().lower()
+            if raw not in COVER_MODES:
+                # 这里不能走 normalize_cover_mode：它会静默退回默认值
+                raise ValueError(f"封面形式只能是 {' / '.join(COVER_MODES)}")
+
+        overrides: dict[str, Any] = {
+            "use_forward_node": self._read_bool(
+                values, "use_forward_node", base.use_forward_node
+            ),
+            "forward_node_name": self._read_text(
+                values, "forward_node_name", base.forward_node_name
+            )
+            or DEFAULT_FORWARD_NODE_NAME,
+            "use_short_names": self._read_bool(
+                values, "use_short_names", base.use_short_names
+            ),
+            "game_short_names": normalize_game_short_names(
+                values["game_short_names"]
+            )
+            if "game_short_names" in values
+            else base.game_short_names,
+            "game_aliases": normalize_game_aliases(values["game_aliases"])
+            if "game_aliases" in values
+            else base.game_aliases,
+            "urgency_marker": self._read_bool(
+                values, "urgency_marker", base.urgency_marker
+            ),
+            "urgency_rules": parse_urgency_rules(values["urgency_rules"])
+            if "urgency_rules" in values
+            else base.urgency_rules,
+            "tier_summary": self._read_bool(
+                values, "tier_summary", base.tier_summary
+            ),
+            "headline_remaining": self._read_bool(
+                values, "headline_remaining", base.headline_remaining
+            ),
+            "sort_by_urgency": self._read_bool(
+                values, "sort_by_urgency", base.sort_by_urgency
+            ),
+            "activity_separator": self._read_text(
+                values, "activity_separator", base.activity_separator
+            ),
+            "include_description": self._read_bool(
+                values, "include_description", base.include_description
+            ),
+            "include_tags": self._read_bool(
+                values, "include_tags", base.include_tags
+            ),
+            "include_extra_times": self._read_bool(
+                values, "include_extra_times", base.include_extra_times
+            ),
+            "cover_mode": cover_mode,
+            "image_mode_detail_link": self._read_bool(
+                values, "image_mode_detail_link", base.image_mode_detail_link
+            ),
+        }
+        return replace(base, **overrides)
+
+    @staticmethod
+    def _sample_activities(game: Game, now: datetime) -> list[Activity]:
+        """内置示例活动，覆盖四个倒计时档位，保证预览随时可用。"""
+        game_id = game.game_id
+        return [
+            Activity(
+                game_id,
+                "sample-1",
+                "限时挑战·星轨回响",
+                start_time=now - timedelta(days=3),
+                end_time=now + timedelta(hours=5),
+                description="示例活动，用来展示剩余不足 24 小时的排版。",
+                tags=("限时", "挑战"),
+            ),
+            Activity(
+                game_id,
+                "sample-2",
+                "「登录活动」签到领奖励",
+                start_time=now - timedelta(days=1),
+                end_time=now + timedelta(days=2, hours=3),
+                description="示例活动，用来展示剩余不足 3 天的排版。",
+                tags=("登录", "福利"),
+            ),
+            Activity(
+                game_id,
+                "sample-3",
+                "复刻·往期活动返场",
+                start_time=now - timedelta(hours=6),
+                end_time=now + timedelta(days=5),
+                tags=("复刻",),
+            ),
+            Activity(
+                game_id,
+                "sample-4",
+                "版本主题活动",
+                start_time=now - timedelta(hours=2),
+                end_time=now + timedelta(days=12),
+                tags=("版本",),
+            ),
+            Activity(
+                game_id,
+                "sample-5",
+                "即将开始的预热活动",
+                start_time=now + timedelta(days=2),
+                end_time=now + timedelta(days=10),
+            ),
+        ]
+
+    async def _save_plugin_config(self) -> None:
+        """把内存里的配置落盘，兼容不同 AstrBot 版本的保存接口。"""
+        saver = getattr(self.plugin.config, "save_config_async", None)
+        if saver is not None:
+            result = await saver()
+            if result is False:
+                raise RuntimeError("配置写入失败")
+            return
+        sync_saver = getattr(self.plugin.config, "save_config", None)
+        if sync_saver is not None:
+            await asyncio.to_thread(sync_saver)
+            return
+        raise RuntimeError("当前 AstrBot 版本不支持保存插件配置")
+
+    async def template(self):
+        """返回模板编辑器需要的当前配置与可选游戏。"""
+        return json_response(
+            {
+                "values": self.plugin.message_format_values(),
+                "games": [
+                    {"game_id": game.game_id, "name": game.name}
+                    for game in self.plugin.registry.ordered()
+                ],
+                "cover_modes": list(COVER_MODES),
+            }
+        )
+
+    async def template_preview(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求内容必须是 JSON 对象", status_code=400)
+
+        try:
+            settings = self._draft_settings(payload.get("values"))
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+
+        now = datetime.now(GAME_TIMEZONE)
+        game_id = str(payload.get("game_id") or "").strip()
+        game = self.plugin.registry.get(game_id) if game_id else None
+
+        note = ""
+        activities: list[Activity] = []
+        if game is not None:
+            try:
+                fetched = await self.plugin.polling.fetch_activities(game_id)
+            except Exception as exc:
+                logger.warning(f"模板预览获取 {game_id} 活动失败: {exc}")
+                note = f"获取真实数据失败，已改用示例活动（{exc}）"
+            else:
+                activities = [
+                    item
+                    for item in fetched
+                    if item.is_active(now) or item.is_upcoming(now)
+                ]
+                if not activities:
+                    note = "这个游戏当前没有进行中的活动，已改用示例活动。"
+
+        if not activities:
+            if game is None:
+                games = self.plugin.registry.ordered()
+                game = games[0] if games else Game("sample", "示例游戏", "sample")
+            activities = self._sample_activities(game, now)
+            note = note or "示例活动，只用来展示排版效果。"
+
+        preview = build_template_preview(
+            game,
+            activities,
+            now,
+            settings,
+            source_name=self.plugin.registry.source_name(game.game_id),
+        )
+        preview["note"] = note
+        return json_response(preview)
+
+    async def template_save(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求内容必须是 JSON 对象", status_code=400)
+        values = payload.get("values")
+        if not isinstance(values, dict):
+            return error_response("缺少要保存的模板内容", status_code=400)
+
+        try:
+            settings = self._draft_settings(values)
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+
+        block = self.plugin.config.get("message_format")
+        block = dict(block) if isinstance(block, dict) else {}
+        block.update(
+            {
+                "use_forward_node": settings.use_forward_node,
+                "forward_node_name": settings.forward_node_name,
+                "use_short_names": settings.use_short_names,
+                "game_short_names": format_game_pairs(settings.game_short_names),
+                "game_aliases": format_game_pairs(settings.game_aliases),
+                "urgency_marker": settings.urgency_marker,
+                "urgency_rules": format_urgency_rules(settings.urgency_rules),
+                "tier_summary": settings.tier_summary,
+                "headline_remaining": settings.headline_remaining,
+                "sort_by_urgency": settings.sort_by_urgency,
+                "activity_separator": settings.activity_separator,
+                "include_description": settings.include_description,
+                "include_tags": settings.include_tags,
+                "include_extra_times": settings.include_extra_times,
+                "cover_mode": settings.cover_mode,
+                "image_mode_detail_link": settings.image_mode_detail_link,
+            }
+        )
+        self.plugin.config["message_format"] = block
+        try:
+            await self._save_plugin_config()
+        except Exception as exc:
+            logger.warning(f"保存消息模板配置失败: {exc}")
+            return error_response(f"保存配置失败: {exc}", status_code=500)
+
+        self.plugin.reload_message_settings()
+        return json_response({"saved": True, "values": self.plugin.message_format_values()})

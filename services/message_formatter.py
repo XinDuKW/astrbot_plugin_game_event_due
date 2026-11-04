@@ -13,9 +13,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import Any
 
 from ..sources.base import Activity, Game, format_datetime, format_remaining
 from .reminder_service import ReminderPlan, reason_label
@@ -35,6 +36,28 @@ PART_IMAGE = "image"
 
 # 一条消息里同时推送多个活动时，插在相邻活动之间的视觉分隔线
 DEFAULT_ACTIVITY_SEPARATOR = "━━━━━━━━━━━━"
+
+# 多个游戏的活动合并进一条消息时，游戏与游戏之间的分隔线
+DEFAULT_GAME_SEPARATOR = "==========="
+# 私聊提醒转发卡片的默认节点名
+DEFAULT_FORWARD_NODE_NAME = "活动提醒"
+# 合并转发卡片预览大概放得下的显示宽度（全角按 2 算）；超了 QQ 会截成 "..."
+FORWARD_TITLE_BUDGET = 32
+
+# 游戏简称：转发节点名和「终:3|铁:2」这种统计都靠它压长度。
+# 左边可以写代号、完整名称或内置别名，匹配规则同 game_aliases。
+DEFAULT_GAME_SHORT_NAMES: tuple[tuple[str, str], ...] = (
+    ("sr", "铁"),
+    ("ys", "原"),
+    ("zzz", "绝"),
+    ("ww", "潮"),
+    ("nte", "环"),
+    ("ba-cn", "蔚国"),
+    ("ba-global", "蔚际"),
+    ("ba-jp", "蔚日"),
+    ("endfield", "终"),
+    ("arknights", "舟"),
+)
 
 COVER_MODE_OFF = "off"
 COVER_MODE_LINK = "link"
@@ -212,6 +235,12 @@ class MessageSettings:
     game_aliases: tuple[tuple[str, str], ...] = ()
     # 图片模式下是否仍附「详情：链接」；默认不附，有图就别再贴链接
     image_mode_detail_link: bool = False
+    # 转发节点名和游戏统计用简称，全名太长会把消息列表挤爆
+    use_short_names: bool = True
+    # 游戏简称：(代号/原名/内置别名 -> 简称)
+    game_short_names: tuple[tuple[str, str], ...] = DEFAULT_GAME_SHORT_NAMES
+    # 私聊提醒转发卡片的节点名；卡片里每行前面的那串字
+    forward_node_name: str = DEFAULT_FORWARD_NODE_NAME
 
     @property
     def cover_max_total_bytes(self) -> int:
@@ -295,6 +324,26 @@ def display_game_name(game: Game, settings: MessageSettings) -> str:
         if key in candidates:
             return alias
     return game.name
+
+
+def normalize_game_short_names(value: object) -> tuple[tuple[str, str], ...]:
+    """解析「代号=简称」的游戏简称，用法与 normalize_game_aliases 一致。"""
+    return normalize_game_aliases(value)
+
+
+def short_game_name(game: Game, settings: MessageSettings) -> str:
+    """游戏在转发节点名、统计行里的简称。
+
+    关闭 use_short_names 时退回显示名；没配简称的游戏也用显示名。
+    """
+    if not settings.use_short_names or not settings.game_short_names:
+        return display_game_name(game, settings)
+    candidates = {game.game_id.casefold(), game.name.casefold()}
+    candidates.update(str(alias).casefold() for alias in game.aliases)
+    for key, short in settings.game_short_names:
+        if key in candidates:
+            return short
+    return display_game_name(game, settings)
 
 
 def truncate(text: str, limit: int) -> str:
@@ -403,11 +452,11 @@ def _assemble(
 
     for segment in segments:
         if isinstance(segment, str):
-            buffer += f"\n\n{segment}"
+            buffer += f"\n\n{segment}" if buffer else segment
             after_heading = True
             continue
 
-        prefix = "\n\n"
+        prefix = "\n\n" if buffer else ""
         if blocks_seen and separator and not after_heading:
             prefix = f"\n\n{separator}\n\n"
         blocks_seen += 1
@@ -483,7 +532,7 @@ def summarize_markers(
 
     if not order:
         return ""
-    return " ".join(f"{marker}{counts[marker]}" for marker in order)
+    return " | ".join(f"{marker}{counts[marker]}" for marker in order)
 
 
 def build_reminder_parts(
@@ -527,6 +576,92 @@ def build_single_reminder_parts(
     )
 
 
+def display_width(text: str) -> int:
+    """估算字符串在消息列表里的显示宽度：全角 2、半角 1。"""
+    width = 0
+    for char in text:
+        code = ord(char)
+        wide = (
+            0x1100 <= code <= 0x115F
+            or 0x2E80 <= code <= 0xA4CF
+            or 0xAC00 <= code <= 0xD7A3
+            or 0xF900 <= code <= 0xFAFF
+            or 0xFE30 <= code <= 0xFE6F
+            or 0xFF00 <= code <= 0xFF60
+            or 0xFFE0 <= code <= 0xFFE6
+            or 0x1F000 <= code <= 0x1FAFF
+            or 0x2600 <= code <= 0x27BF
+        )
+        width += 2 if wide else 1
+    return width
+
+
+def fit_forward_title(
+    candidates: Sequence[str],
+    budget: int = FORWARD_TITLE_BUDGET,
+) -> str:
+    """从长到短挑第一个放得下的标题，保证卡片预览里不出现 "..."。"""
+    chosen = candidates[-1] if candidates else ""
+    for candidate in candidates:
+        if display_width(candidate) <= budget:
+            return candidate
+    return chosen
+
+
+def _section_heading(
+    label: str,
+    items: Sequence[Activity],
+    now: datetime,
+    settings: MessageSettings,
+) -> str:
+    """分段标题：能统计档位时写成「▎进行中（🟦5 | 🟩1）」。"""
+    markers = summarize_markers(items, now, settings)
+    return f"▎{label}（{markers or len(items)}）"
+
+
+def overview_title_candidates(
+    game: Game,
+    active: Sequence[Activity],
+    upcoming: Sequence[Activity],
+    now: datetime,
+    settings: MessageSettings,
+) -> list[str]:
+    """转发标题的候选形态（由长到短），保证四档色块都露得出来。"""
+    name = display_game_name(game, settings)
+    short = short_game_name(game, settings)
+    items = list(active) or list(upcoming)
+    label = "进行中" if active else "即将开始"
+    if not items:
+        return [
+            f"🎮 {name} · 当前活动",
+            f"{short} · 当前活动",
+            short,
+        ]
+    markers = summarize_markers(items, now, settings)
+    compact = markers.replace(" | ", " ")
+    tail = compact or str(len(items))
+    return [
+        f"🎮 {name} · 当前活动 ▎{label}（{markers or len(items)}）",
+        f"🎮 {name} · 当前活动 {tail}",
+        f"{short} · 当前活动 {tail}",
+        f"{short} {tail}",
+    ]
+
+
+def build_overview_title(
+    game: Game,
+    activities: Sequence[Activity],
+    now: datetime,
+    settings: MessageSettings,
+) -> str:
+    """转发标题：按卡片宽度自动选最长还能放下的那种写法。"""
+    active = [item for item in activities if item.is_active(now)]
+    upcoming = [item for item in activities if item.is_upcoming(now)]
+    return fit_forward_title(
+        overview_title_candidates(game, active, upcoming, now, settings)
+    )
+
+
 def build_overview_parts(
     game: Game,
     activities: Sequence[Activity],
@@ -551,7 +686,7 @@ def build_overview_parts(
         segments.append("当前没有进行中或即将开始的活动。")
     else:
         if active:
-            segments.append(f"▎进行中（{len(active)}）")
+            segments.append(_section_heading("进行中", active, now, settings))
             for item in active[:MAX_ACTIVE_IN_OVERVIEW]:
                 segments.append(build_activity_block(item, (), now, settings))
             if len(active) > MAX_ACTIVE_IN_OVERVIEW:
@@ -560,7 +695,9 @@ def build_overview_parts(
                 )
 
         if upcoming:
-            segments.append(f"▎即将开始（{len(upcoming)}）")
+            segments.append(
+                _section_heading("即将开始", upcoming, now, settings)
+            )
             for item in upcoming[:MAX_UPCOMING_IN_OVERVIEW]:
                 segments.append(
                     build_activity_block(
@@ -584,6 +721,64 @@ def build_overview_parts(
         segments,
         settings.activity_separator,
     )
+
+
+def build_overview_blocks(
+    game: Game,
+    activities: Sequence[Activity],
+    now: datetime,
+    settings: MessageSettings,
+    *,
+    source_name: str = "",
+) -> tuple[str, list[list[MessagePart]]]:
+    """构建「当前活动一览」的标题与逐活动片段。
+
+    合并转发时标题单独占一个节点、每个活动再各占一个节点，点开就是一串活动；
+    标题里带上进行中/即将开始的数量，不点开也能知道有几条。
+    """
+    active = sorted(
+        (item for item in activities if item.is_active(now)),
+        key=lambda item: item.end_time or item.sort_key()[0],
+    )
+    upcoming = sorted(
+        (item for item in activities if item.is_upcoming(now)),
+        key=lambda item: item.start_time or item.sort_key()[0],
+    )
+
+    header = fit_forward_title(
+        overview_title_candidates(game, active, upcoming, now, settings)
+    )
+
+    blocks: list[list[MessagePart]] = []
+    for item in active[:MAX_ACTIVE_IN_OVERVIEW]:
+        blocks.append(build_activity_block(item, (), now, settings))
+    if len(active) > MAX_ACTIVE_IN_OVERVIEW:
+        blocks.append(
+            [
+                MessagePart(
+                    PART_TEXT,
+                    f"……另有 {len(active) - MAX_ACTIVE_IN_OVERVIEW} 个进行中的活动",
+                )
+            ]
+        )
+    for item in upcoming[:MAX_UPCOMING_IN_OVERVIEW]:
+        blocks.append(
+            build_activity_block(item, (), now, settings, include_remaining=False)
+        )
+    if len(upcoming) > MAX_UPCOMING_IN_OVERVIEW:
+        blocks.append(
+            [
+                MessagePart(
+                    PART_TEXT,
+                    f"……另有 {len(upcoming) - MAX_UPCOMING_IN_OVERVIEW} 个即将开始的活动",
+                )
+            ]
+        )
+    if not blocks:
+        blocks.append([MessagePart(PART_TEXT, "当前没有进行中或即将开始的活动。")])
+    if source_name:
+        blocks.append([MessagePart(PART_TEXT, f"（数据来源：{source_name}）")])
+    return header, blocks
 
 
 # ---- 纯文本便捷封装（WebUI 预览、测试与降级输出使用） ----
@@ -620,28 +815,126 @@ def build_overview_message(
     )
 
 
+@dataclass(frozen=True, slots=True)
+class UrgentGroup:
+    """紧急提醒里同一个游戏的一组活动。"""
+
+    game_id: str
+    name: str
+    short: str
+    activities: tuple[Activity, ...]
+
+
+def _remaining_key(activity: Activity, now: datetime) -> tuple:
+    remaining = activity.remaining(now)
+    return (remaining is None, remaining or timedelta(0))
+
+
+def build_urgent_dm_groups(
+    activities: Sequence[Activity],
+    now: datetime,
+    settings: MessageSettings,
+    *,
+    games: Mapping[str, Game] | None = None,
+) -> list[UrgentGroup]:
+    """按游戏分组：组内最急的排前面，组间也按最急的排。"""
+    lookup = games or {}
+    buckets: dict[str, list[Activity]] = {}
+    for activity in activities:
+        buckets.setdefault(activity.game_id, []).append(activity)
+
+    groups: list[UrgentGroup] = []
+    for game_id, items in buckets.items():
+        game = lookup.get(game_id)
+        name = display_game_name(game, settings) if game else game_id
+        short = short_game_name(game, settings) if game else game_id
+        ordered = list(items)
+        if settings.sort_by_urgency:
+            ordered.sort(key=lambda item: _remaining_key(item, now))
+        groups.append(UrgentGroup(game_id, name, short, tuple(ordered)))
+
+    if settings.sort_by_urgency and len(groups) > 1:
+        groups.sort(key=lambda group: _remaining_key(group.activities[0], now))
+    return groups
+
+
+def build_urgent_dm_headline(groups: Sequence[UrgentGroup]) -> str:
+    """第一行：一共有几个活动要结束了。"""
+    total = sum(len(group.activities) for group in groups)
+    if total > 1:
+        return f"🚨 {total} 个活动马上就要结束了！"
+    return "🚨 活动马上就要结束了！"
+
+
+def build_urgent_dm_summary(groups: Sequence[UrgentGroup]) -> str:
+    """第二行：各游戏分布（简称:数量）；单个游戏也保留，方便确认催的是谁。"""
+    if not groups:
+        return ""
+    return " | ".join(
+        f"{group.short}:{len(group.activities)}" for group in groups
+    )
+
+
+def build_urgent_dm_title(
+    groups: Sequence[UrgentGroup],
+    settings: MessageSettings,
+) -> str:
+    """两行标题：总条数 + 各游戏分布（简称:数量）。"""
+    first = build_urgent_dm_headline(groups)
+    summary = build_urgent_dm_summary(groups)
+    return f"{first}\n🚨 {summary}" if summary else first
+
+
+def build_urgent_dm_body_parts(
+    groups: Sequence[UrgentGroup],
+    now: datetime,
+    settings: MessageSettings,
+    *,
+    headline: str = "",
+    ack_hint: str = "",
+) -> list[MessagePart]:
+    """构建紧急私聊提醒的正文（按游戏分组的详情）。
+
+    ``headline`` 是正文最上面那一行（通常是各游戏分布），为空时不占位。
+    分组之间用 ``===========`` 隔开，组内活动之间用普通分隔线。
+    """
+    segments: list[str | list[MessagePart]] = []
+    for index, group in enumerate(groups):
+        if index:
+            segments.append(DEFAULT_GAME_SEPARATOR)
+        segments.append(f"🎮 {group.name}（{len(group.activities)} 个）")
+        segments.extend(
+            build_activity_block(activity, (), now, settings)
+            for activity in group.activities
+        )
+    if ack_hint:
+        segments.append(ack_hint)
+    return _assemble(headline, segments, settings.activity_separator)
+
+
 def build_urgent_dm_parts(
     activities: Sequence[Activity],
     now: datetime,
     settings: MessageSettings,
     *,
     ack_hint: str = "",
+    games: Mapping[str, Game] | None = None,
 ) -> list[MessagePart]:
-    """构建紧急私聊提醒的消息片段。
+    """构建紧急私聊提醒的消息片段（一条普通消息）。
 
-    每个活动一个块（标题带剩余时间标记），结尾附一句「怎么停止提醒」的说明。
+    顶部两行（总条数 + 各游戏分布），之后按游戏分组，组间用分隔线隔开，
+    结尾附一句「怎么停止提醒」的说明。
     """
-    blocks: list[str | list[MessagePart]] = [
-        build_activity_block(activity, (), now, settings) for activity in activities
-    ]
-    if ack_hint:
-        blocks.append(ack_hint)
-
-    if len(activities) > 1:
-        header = f"🚨 {len(activities)} 个活动马上就要结束了！"
-    else:
-        header = "🚨 活动马上就要结束了！"
-    return _assemble(header, blocks, settings.activity_separator)
+    groups = build_urgent_dm_groups(activities, now, settings, games=games)
+    if not groups:
+        return []
+    return build_urgent_dm_body_parts(
+        groups,
+        now,
+        settings,
+        headline=build_urgent_dm_title(groups, settings),
+        ack_hint=ack_hint,
+    )
 
 
 def build_urgent_dm_message(
@@ -650,7 +943,178 @@ def build_urgent_dm_message(
     settings: MessageSettings,
     *,
     ack_hint: str = "",
+    games: Mapping[str, Game] | None = None,
 ) -> str:
     return parts_to_text(
-        build_urgent_dm_parts(activities, now, settings, ack_hint=ack_hint)
+        build_urgent_dm_parts(
+            activities, now, settings, ack_hint=ack_hint, games=games
+        )
     )
+
+
+# ---- WebUI 模板编辑器：结构化预览 ----
+#
+# 页面要按 QQ 真实的排版把消息画出来，而不是拿一段纯文本再猜结构。这里把
+# 「真正会发出去的那条消息」拆成带类型的段落：标题、分段标题、活动块、分隔线。
+# 前端只负责套样式，不需要知道消息是怎么拼出来的，所以改了文案之后预览也跟着变，
+# 不会出现「页面显示一套、实际发出去另一套」。
+
+# 转发卡片顶部那一行
+FORWARD_CARD_TITLE = "群聊的聊天记录"
+
+# 消息发送者的显示名（页面预览里头像旁那行字）
+DEFAULT_SENDER_NAME = "游戏活动日历"
+
+
+def format_game_pairs(pairs: Sequence[tuple[str, str]]) -> str:
+    """把别名/简称配置还原成「代号=显示名」的多行文本，供页面编辑。"""
+    return "\n".join(
+        f"{key}={value}" for key, value in pairs if str(key).strip()
+    )
+
+
+def format_urgency_rules(levels: Sequence[UrgencyLevel]) -> str:
+    """把档位表还原成 1:🟥,3:🟧,7:🟩,*:🟦 这种写法。"""
+    parts: list[str] = []
+    for level in levels:
+        days = "*" if level.is_fallback else f"{level.max_days:g}"
+        parts.append(f"{days}:{level.marker}")
+    return ",".join(parts)
+
+
+def _preview_activity(
+    activity: Activity,
+    now: datetime,
+    settings: MessageSettings,
+    *,
+    include_remaining: bool = True,
+) -> dict[str, Any]:
+    """单个活动块的预览模型：文本行 + 可选封面。"""
+    parts = build_activity_block(
+        activity, (), now, settings, include_remaining=include_remaining
+    )
+    lines: list[str] = []
+    image = ""
+    for part in parts:
+        if part.is_image:
+            image = part.value
+        else:
+            lines.extend(part.value.split("\n"))
+    return {"kind": "activity", "lines": lines, "image": image}
+
+
+def build_template_preview(
+    game: Game,
+    activities: Sequence[Activity],
+    now: datetime,
+    settings: MessageSettings,
+    *,
+    source_name: str = "",
+    sender_name: str = DEFAULT_SENDER_NAME,
+    limit: int = 4,
+) -> dict[str, Any]:
+    """构建页面预览模型，同时给出「普通消息」和「合并转发」两种形态。
+
+    sections 里已经按发送规则插好了分隔线与分段标题，前端按顺序画即可；
+    nodes 是合并转发里每个活动各自一个节点的样子（第一个节点是标题）。
+    """
+    active = sorted(
+        (item for item in activities if item.is_active(now)),
+        key=lambda item: item.end_time or item.sort_key()[0],
+    )
+    upcoming = sorted(
+        (item for item in activities if item.is_upcoming(now)),
+        key=lambda item: item.start_time or item.sort_key()[0],
+    )
+
+    sections: list[dict[str, Any]] = []
+    blocks_seen = 0
+    after_heading = False
+
+    def add_heading(label: str, items: Sequence[Activity]) -> None:
+        nonlocal after_heading
+        sections.append(
+            {
+                "kind": "heading",
+                "text": _section_heading(label, items, now, settings),
+            }
+        )
+        after_heading = True
+
+    def add_activity(activity: Activity, *, include_remaining: bool) -> None:
+        nonlocal blocks_seen, after_heading
+        # 与 _assemble 一致：分隔线只出现在相邻活动块之间
+        if blocks_seen and settings.activity_separator and not after_heading:
+            sections.append(
+                {"kind": "separator", "text": settings.activity_separator}
+            )
+        blocks_seen += 1
+        after_heading = False
+        sections.append(
+            _preview_activity(
+                activity, now, settings, include_remaining=include_remaining
+            )
+        )
+
+    if not active and not upcoming:
+        sections.append(
+            {"kind": "note", "text": "当前没有进行中或即将开始的活动。"}
+        )
+    else:
+        if active:
+            add_heading("进行中", active)
+            for item in active[:limit]:
+                add_activity(item, include_remaining=True)
+            if len(active) > limit:
+                sections.append(
+                    {
+                        "kind": "note",
+                        "text": f"……另有 {len(active) - limit} 个进行中的活动",
+                    }
+                )
+        if upcoming:
+            add_heading("即将开始", upcoming)
+            for item in upcoming[:limit]:
+                add_activity(item, include_remaining=False)
+            if len(upcoming) > limit:
+                sections.append(
+                    {
+                        "kind": "note",
+                        "text": (
+                            f"……另有 {len(upcoming) - limit} 个即将开始的活动"
+                        ),
+                    }
+                )
+
+    if source_name:
+        sections.append({"kind": "note", "text": f"（数据来源：{source_name}）"})
+
+    node_name = short_game_name(game, settings)
+    nodes: list[dict[str, Any]] = []
+    for item in active[:limit]:
+        block = _preview_activity(item, now, settings, include_remaining=True)
+        nodes.append({"name": node_name, "lines": block["lines"], "image": block["image"]})
+    for item in upcoming[:limit]:
+        block = _preview_activity(item, now, settings, include_remaining=False)
+        nodes.append({"name": node_name, "lines": block["lines"], "image": block["image"]})
+
+    return {
+        "game_id": game.game_id,
+        "game_name": display_game_name(game, settings),
+        "short_name": node_name,
+        "count": len(activities),
+        "sender": {"name": sender_name, "avatar": "logo.png"},
+        "plain": {
+            "header": f"🎮 {display_game_name(game, settings)} · 当前活动",
+            "sections": sections,
+        },
+        "forward": {
+            "card_title": FORWARD_CARD_TITLE,
+            "title_node": {
+                "name": node_name,
+                "lines": [build_overview_title(game, activities, now, settings)],
+            },
+            "nodes": nodes,
+            "footer": f"查看 {len(nodes) + 1} 条转发消息",
+        },
+    }
