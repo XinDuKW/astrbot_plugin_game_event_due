@@ -71,7 +71,7 @@
 | 数据源 | 游戏 | 说明 |
 | --- | --- | --- |
 | [SRA 公共 API](https://starrailassistant.top/reference/public-api/) | 崩坏：星穹铁道、原神、绝区零、鸣潮、异环、蔚蓝档案（国服 / 国际服 / 日服） | 无需认证，返回活动名、描述、开始时间、结束时间与封面 |
-| [AKEData](https://www.akedata.wiki/) | 明日方舟：终末地 | 官方配置表，含活动与寻访卡池；需要访问境外站点 |
+| [AKEData](https://www.akedata.wiki/) | 明日方舟：终末地 | 官方配置表，含活动与寻访卡池；站点在境内，首次拉取约 12 MB |
 | [PRTS](https://prts.wiki/) | 明日方舟 | Semantic MediaWiki 查询，含活动分类与兑换结束时间；站点有限流 |
 
 ### 游戏代号速查
@@ -102,8 +102,10 @@
 将本目录放入 AstrBot 的 `data/plugins/`，在插件管理页重载即可。依赖只有 `httpx`
 （AstrBot 自带）。
 
-> 如果服务器访问境外站点不稳定，请在配置里填写代理地址，否则终末地（AKEData）
-> 可能无法更新数据。
+> 服务器访问 SRA（`starrailassistant.top`，香港）不稳定时，在配置里填代理地址即可。
+> PRTS 与 AKEData 的服务器都在国内，默认**直连**、不经过代理——走代理反而会绕远，
+> AKEData 套了 Cloudflare，从境外出口访问还可能直接返回 404。要调整这个名单，
+> 改配置里的「直连域名」。
 
 ## 指令
 
@@ -219,6 +221,7 @@
 | `refresh_on_start` | true | 启动时立即执行一轮检查 |
 | `request_timeout_seconds` | 20 | 单次请求超时 |
 | `proxy` | 空 | 代理地址，如 `http://127.0.0.1:7890` |
+| `direct_hosts` | `prts.wiki, media.prts.wiki, data.akedata.wiki` | 这些域名即使配了代理也直连（含子域名）；清空表示全部走代理 |
 | `cache_dir` | 空 | 缓存目录，留空用插件数据目录 |
 
 ### 数据源设置

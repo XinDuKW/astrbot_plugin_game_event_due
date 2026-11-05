@@ -20,6 +20,7 @@ from typing import Any
 
 from astrbot.api import logger
 
+from ..sources.base import build_direct_mounts
 from .message_formatter import DEFAULT_COVER_MAX_WIDTH
 
 DEFAULT_QUALITY = 82
@@ -78,6 +79,7 @@ class CoverResolver:
         quality: int = DEFAULT_QUALITY,
         timeout: float = 20.0,
         proxy: str | None = None,
+        direct_hosts: Sequence[str] = (),
         max_cache_entries: int = DEFAULT_MAX_CACHE_ENTRIES,
         user_agent: str = DEFAULT_USER_AGENT,
     ) -> None:
@@ -86,6 +88,7 @@ class CoverResolver:
         self.quality = min(95, max(30, int(quality)))
         self.timeout = max(5.0, float(timeout))
         self.proxy = proxy or None
+        self.direct_hosts = tuple(direct_hosts or ())
         self.max_cache_entries = max(1, int(max_cache_entries))
         self.user_agent = user_agent
 
@@ -112,6 +115,9 @@ class CoverResolver:
         }
         if self.proxy:
             kwargs["proxy"] = self.proxy
+            mounts = build_direct_mounts(self.direct_hosts)
+            if mounts:
+                kwargs["mounts"] = mounts
         self._client = httpx.AsyncClient(**kwargs)
         return self._client
 

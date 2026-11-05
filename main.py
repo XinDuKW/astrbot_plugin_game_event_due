@@ -48,11 +48,13 @@ from .services.subscription_service import (
     resolve_policy,
 )
 from .sources import (
+    DEFAULT_DIRECT_HOSTS,
     GAME_TIMEZONE,
     AkedataSource,
     JsonHttpClient,
     PrtsSource,
     SraSource,
+    normalize_direct_hosts,
 )
 from .services.urgent_dm_service import (
     UrgentDmSettings,
@@ -136,6 +138,11 @@ class GameActivityPlugin(Star):
             5, self._cfg_int("basic", "request_timeout_seconds", 20)
         )
         self.proxy = str(self._cfg_str("basic", "proxy", "") or "").strip()
+        # 配了代理时，国内站点默认直连（见 sources.base.DEFAULT_DIRECT_HOSTS）；
+        # 清空这一项表示所有请求都走代理。
+        self.direct_hosts = normalize_direct_hosts(
+            self._cfg("basic", "direct_hosts", ", ".join(DEFAULT_DIRECT_HOSTS))
+        )
         self.cache_dir = self._resolve_cache_dir(
             self._cfg_str("basic", "cache_dir", "")
         )
@@ -199,6 +206,7 @@ class GameActivityPlugin(Star):
             proxy=self.proxy or None,
             timeout=float(self.request_timeout),
             cache_dir=self.cache_dir,
+            direct_hosts=self.direct_hosts,
         )
         self.registry = GameRegistry(self._build_sources())
         if not self.registry.games:
@@ -231,6 +239,7 @@ class GameActivityPlugin(Star):
             max_width=self.message_settings.cover_max_width,
             timeout=float(self.request_timeout),
             proxy=self.proxy or None,
+            direct_hosts=self.direct_hosts,
         )
         self.delivery = ActivityDeliveryService(
             context, self.message_settings, self.cover_resolver

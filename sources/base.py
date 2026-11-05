@@ -27,6 +27,63 @@ DEFAULT_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
 )
 
+# 国内站点直连、境外站点走代理：整站套代理会把本来更近的站绕到境外节点，
+# 套了 Cloudflare 的站点在非预期地区出口上还容易返回 404。
+DEFAULT_DIRECT_HOSTS: tuple[str, ...] = (
+    "prts.wiki",
+    "media.prts.wiki",
+    "data.akedata.wiki",
+)
+
+_HOST_SCHEME_PATTERN = re.compile(r"^[a-z][a-z0-9+.\-]*://", re.IGNORECASE)
+
+
+def _host_of(url: str) -> str:
+    """从 URL 或主机名里取出纯主机名（小写、去掉协议 / 路径 / 端口）。"""
+    text = _HOST_SCHEME_PATTERN.sub("", str(url or "").strip().lower())
+    return text.split("/")[0].split(":")[0].strip(".")
+
+
+def normalize_direct_hosts(value: Any) -> tuple[str, ...]:
+    """把配置里的「直连域名」规范化为小写主机名列表。
+
+    支持逗号、分号、顿号、空白与换行分隔；带协议、路径或端口的写法会被裁成
+    主机名，例如 https://media.prts.wiki/x.png 会变成 media.prts.wiki。
+    """
+    if value is None:
+        return DEFAULT_DIRECT_HOSTS
+    items: Iterable[Any] = (
+        re.split(r"[\s,;，；、]+", value) if isinstance(value, str) else list(value)
+    )
+    hosts: list[str] = []
+    for item in items:
+        host = _host_of(str(item))
+        if host and host not in hosts:
+            hosts.append(host)
+    return tuple(hosts)
+
+
+def is_direct_host(url: str, hosts: Sequence[str]) -> bool:
+    """判断 URL 是否落在直连名单内（含其子域名）。"""
+    host = _host_of(url)
+    if not host:
+        return False
+    return any(host == item or host.endswith("." + item) for item in hosts)
+
+
+def build_direct_mounts(hosts: Sequence[str]) -> dict[str, Any]:
+    """为直连域名构造 httpx mounts：这些域名不经过代理，其余保持代理。"""
+    if not hosts:
+        return {}
+    import httpx
+
+    mounts: dict[str, Any] = {}
+    for host in hosts:
+        mounts[f"all://{host}"] = httpx.AsyncHTTPTransport()
+        mounts[f"all://*.{host}"] = httpx.AsyncHTTPTransport()
+    return mounts
+
+
 _TOKEN_STRIP_PATTERN = re.compile(r"[^\w]+", re.UNICODE)
 _HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 
@@ -292,8 +349,10 @@ class JsonHttpClient:
         timeout: float = 20.0,
         cache_dir: Path | None = None,
         user_agent: str = DEFAULT_USER_AGENT,
+        direct_hosts: Sequence[str] = (),
     ) -> None:
         self.proxy = proxy or None
+        self.direct_hosts = tuple(direct_hosts or ())
         self.timeout = max(5.0, float(timeout))
         self.cache_dir = Path(cache_dir) if cache_dir else None
         self.user_agent = user_agent
@@ -318,6 +377,9 @@ class JsonHttpClient:
         }
         if self.proxy:
             kwargs["proxy"] = self.proxy
+            mounts = build_direct_mounts(self.direct_hosts)
+            if mounts:
+                kwargs["mounts"] = mounts
         self._client = httpx.AsyncClient(**kwargs)
         return self._client
 

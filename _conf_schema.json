@@ -26,7 +26,13 @@
         "description": "代理地址（留空则不使用代理）",
         "type": "string",
         "default": "",
-        "hint": "例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080。境外数据源（AKEData）通常需要代理。"
+        "hint": "例如 http://127.0.0.1:7890 或 socks5://127.0.0.1:1080。下一项列出的域名不会走这个代理。"
+      },
+      "direct_hosts": {
+        "description": "直连域名（不经过代理）",
+        "type": "text",
+        "default": "prts.wiki, media.prts.wiki, data.akedata.wiki",
+        "hint": "配置了代理时，这些域名仍然直连：PRTS 与 AKEData 的服务器都在国内，绕到境外节点反而更慢，AKEData 套了 Cloudflare，从境外出口访问还可能直接 404。SRA 在香港，留在外面走代理即可。多个域名用逗号或换行分隔；清空表示全部走代理。"
       },
       "cache_dir": {
         "description": "缓存目录（留空使用插件数据目录）",
@@ -57,7 +63,7 @@
         "description": "启用 AKEData（明日方舟：终末地）",
         "type": "bool",
         "default": true,
-        "hint": "数据来源：data.akedata.wiki，游戏内配置表。需要访问境外站点，建议配置代理。"
+        "hint": "数据来源：data.akedata.wiki，游戏内配置表。站点在境内，可直接连接；首次拉取配置表约 12 MB，仅大版本更新时才会重新下载。"
       },
       "akedata_api_base": {
         "description": "AKEData 地址",
