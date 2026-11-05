@@ -48,10 +48,10 @@
     "hint": "控制各数据源的启用状态与接口地址。关闭某个数据源后，其游戏不会出现在订阅选项中。",
     "items": {
       "enable_sra": {
-        "description": "启用 SRA 公共 API（米哈游系 / 库洛 / 蔚蓝档案）",
+        "description": "启用 SRA 公共 API（米哈游系 / 库洛 / 蔚蓝档案 等 18 款）",
         "type": "bool",
         "default": true,
-        "hint": "数据来源：starrailassistant.top 公开接口。支持星穹铁道、原神、绝区零、鸣潮、异环及蔚蓝档案国服/国际服/日服。"
+        "hint": "数据来源：starrailassistant.top 公开接口。支持星穹铁道、原神、绝区零、鸣潮、异环、蔚蓝档案国服/国际服/日服、明日方舟、终末地、星塔旅人、无限暖暖、少女前线2、战双帕弥什、卡厄斯梦境、棕色尘埃2、NIKKE、火影忍者。后 8 款只有这一个来源，数据由社区维护，封面与时间精度参差不齐。"
       },
       "sra_api_base": {
         "description": "SRA 公共 API 地址",
@@ -82,6 +82,26 @@
         "type": "bool",
         "default": true,
         "hint": "数据来源：prts.wiki。该站点有较严格的访问频率限制，插件会自动限速并使用长缓存。"
+      },
+      "arknights_source": {
+        "description": "明日方舟：使用哪个数据源",
+        "type": "string",
+        "default": "prts",
+        "options": [
+          "prts",
+          "sra"
+        ],
+        "hint": "prts = PRTS（含活动标签与兑换结束时间，站点有限流）；sra = SRA 公共 API（更新更快、无频率限制）。切换数据源后，这款游戏的活动会被当作全新活动再推送一次。"
+      },
+      "endfield_source": {
+        "description": "明日方舟：终末地：使用哪个数据源",
+        "type": "string",
+        "default": "akedata",
+        "options": [
+          "akedata",
+          "sra"
+        ],
+        "hint": "akedata = AKEData（游戏内配置表，含寻访卡池，首次约 12 MB）；sra = SRA 公共 API（轻量、更新更快）。切换数据源后，这款游戏的活动会被当作全新活动再推送一次。"
       },
       "prts_api_base": {
         "description": "PRTS API 地址",
@@ -228,8 +248,16 @@
         "description": "活动封面处理方式",
         "type": "string",
         "default": "image",
-        "options": ["image", "link", "off"],
-        "labels": ["直接发送图片", "仅附带链接", "不附带封面"],
+        "options": [
+          "image",
+          "link",
+          "off"
+        ],
+        "labels": [
+          "直接发送图片",
+          "仅附带链接",
+          "不附带封面"
+        ],
         "hint": "image=把封面作为图片直接发出，图片源或适配器不可用时自动退化为文字+链接；link=只发封面链接文本；off=完全不附带封面。"
       },
       "cover_compress": {

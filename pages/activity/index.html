@@ -17,6 +17,9 @@
           </div>
         </div>
         <div class="topbar-actions">
+          <button class="ghost-button" id="settings-button" type="button">
+            数据源
+          </button>
           <button class="ghost-button" id="template-button" type="button">
             消息模板
           </button>
@@ -115,6 +118,49 @@
             </button>
             <button class="primary-button" id="template-save" type="button">
               保存模板
+            </button>
+          </div>
+        </footer>
+      </div>
+    </div>
+
+
+    <div
+      class="modal is-hidden"
+      id="settings-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-label="数据源与代理设置"
+    >
+      <div class="modal-panel is-narrow">
+        <header class="modal-head">
+          <div>
+            <h2>数据源与代理</h2>
+            <p class="modal-sub">
+              改动保存后立即生效：会重建 HTTP 客户端并清空图片缓存。
+            </p>
+          </div>
+          <button
+            class="icon-button"
+            id="settings-close"
+            type="button"
+            title="关闭"
+            aria-label="关闭"
+          >
+            ×
+          </button>
+        </header>
+        <div class="modal-body">
+          <div class="settings-body" id="settings-body"></div>
+        </div>
+        <footer class="modal-foot">
+          <span class="field-hint" id="settings-note"></span>
+          <div class="detail-actions">
+            <button class="ghost-button" id="settings-reset" type="button">
+              还原修改
+            </button>
+            <button class="primary-button" id="settings-save" type="button">
+              保存设置
             </button>
           </div>
         </footer>

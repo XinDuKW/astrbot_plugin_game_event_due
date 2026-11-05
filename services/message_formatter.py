@@ -57,6 +57,14 @@ DEFAULT_GAME_SHORT_NAMES: tuple[tuple[str, str], ...] = (
     ("ba-jp", "蔚日"),
     ("endfield", "终"),
     ("arknights", "舟"),
+    ("xtlr", "星塔"),
+    ("infinitynikki", "暖暖"),
+    ("gf2", "少前2"),
+    ("pgr", "战双"),
+    ("czn", "卡厄斯"),
+    ("bd2", "棕尘"),
+    ("nikke", "NIKKE"),
+    ("hyrz", "火影"),
 )
 
 COVER_MODE_OFF = "off"

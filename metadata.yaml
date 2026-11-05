@@ -6,9 +6,10 @@ desc: >-
   剩余 7 天 / 3 天 / 24 小时分级到期提醒、每会话关键词黑白名单过滤、封面图自动
   压缩发送，并提供 Plugin Pages 管理页。
 
-  数据来源：SRA 公共 API（崩坏：星穹铁道、原神、绝区零、鸣潮、异环、蔚蓝档案
-  国服 / 国际服 / 日服）、AKEData（明日方舟：终末地）、PRTS（明日方舟）。
-version: 1.2.1
+  数据来源：SRA 公共 API（共 18 款，含崩坏：星穹铁道、原神、绝区零、鸣潮、异环、
+  蔚蓝档案国服 / 国际服 / 日服）、AKEData（明日方舟：终末地）、PRTS（明日方舟）。
+  明日方舟与终末地可在管理页切换用哪个源；数据源开关、代理与直连域名也都能在网页里改。
+version: 1.3.0
 author: XinDuKW
 repo: https://github.com/XinDuKW/astrbot_plugin_game_event_due
 tags:

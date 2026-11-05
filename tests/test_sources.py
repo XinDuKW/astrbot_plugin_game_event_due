@@ -415,8 +415,53 @@ def build_registry() -> GameRegistry:
 
 def test_registry_contains_expected_games():
     registry = build_registry()
-    assert len(registry.games) == 10
+    assert len(registry.games) == 18
     assert registry.get("endfield") is not None
+
+
+@pytest.mark.parametrize(
+    ("game_id", "name"),
+    [
+        ("xtlr", "星塔旅人"),
+        ("infinitynikki", "无限暖暖"),
+        ("gf2", "少女前线2：追放"),
+        ("pgr", "战双帕弥什"),
+        ("czn", "卡厄斯梦境（国际服）"),
+        ("bd2", "棕色尘埃2"),
+        ("nikke", "NIKKE（国际服）"),
+        ("hyrz", "火影忍者"),
+    ],
+)
+def test_registry_only_sra_games_are_registered(game_id, name):
+    registry = build_registry()
+    game = registry.get(game_id)
+    assert game is not None
+    assert game.name == name
+    assert game.source_id == "sra"
+    assert registry.source_options(game_id) == ()
+
+
+@pytest.mark.parametrize(
+    ("token", "expected"),
+    [
+        ("星塔", "xtlr"),
+        ("暖暖", "infinitynikki"),
+        ("少前2", "gf2"),
+        ("少前", "gf2"),
+        ("战双", "pgr"),
+        ("卡厄斯", "czn"),
+        ("棕尘", "bd2"),
+        ("bd2", "bd2"),
+        ("妮姬", "nikke"),
+        ("nikke", "nikke"),
+        ("火影", "hyrz"),
+    ],
+)
+def test_registry_resolves_new_sra_game_aliases(token, expected):
+    registry = build_registry()
+    games = registry.resolve(token)
+    assert games
+    assert games[0].game_id == expected
 
 
 @pytest.mark.parametrize(
@@ -530,3 +575,82 @@ def test_build_direct_mounts_covers_host_and_subdomains():
 def test_http_client_keeps_direct_hosts():
     client = JsonHttpClient(direct_hosts=DEFAULT_DIRECT_HOSTS)
     assert client.direct_hosts == DEFAULT_DIRECT_HOSTS
+
+
+# ---- 同一游戏多数据源：可切换来源 ----
+
+
+def test_registry_defaults_prts_and_akedata_for_shared_games():
+    registry = build_registry()
+    assert registry.source_for("arknights").source_id == "prts"
+    assert registry.source_for("endfield").source_id == "akedata"
+    assert registry.get("arknights").source_id == "prts"
+    assert {source.source_id for source in registry.sources_for("arknights")} == {
+        "sra",
+        "prts",
+    }
+
+
+def test_registry_preferred_switches_shared_game_to_sra():
+    client = FakeClient()
+    registry = GameRegistry(
+        [SraSource(client), AkedataSource(client), PrtsSource(client)],
+        preferred={"arknights": "sra", "endfield": "sra"},
+    )
+    assert registry.source_for("arknights").source_id == "sra"
+    assert registry.source_for("endfield").source_id == "sra"
+    assert registry.get("arknights").source_id == "sra"
+    # 其它游戏不受影响
+    assert registry.source_for("sr").source_id == "sra"
+    assert registry.source_for("ys").source_id == "sra"
+
+
+def test_registry_falls_back_when_preferred_source_is_disabled():
+    client = FakeClient()
+    registry = GameRegistry([SraSource(client)], preferred={"arknights": "prts"})
+    assert registry.source_for("arknights").source_id == "sra"
+    assert registry.source_options("arknights") == ()
+
+
+def test_registry_source_options_empty_for_single_source_game():
+    registry = build_registry()
+    assert registry.source_options("sr") == ()
+    assert len(registry.source_options("arknights")) == 2
+    assert len(registry.source_options("endfield")) == 2
+
+
+def test_registry_ignores_unknown_preferred_source():
+    client = FakeClient()
+    registry = GameRegistry([SraSource(client)], preferred={"arknights": "prts"})
+    assert registry.source_name("arknights") == "SRA 公共 API"
+
+
+@pytest.mark.anyio
+async def test_sra_fetch_maps_shared_game_ids_to_remote_ids():
+    payload = {
+        "version": "2026-11",
+        "activities": [
+            {
+                "name": "「冻土与火种」网页活动",
+                "startTime": "2026-10-24T20:00:00",
+                "endTime": "2026-11-24T03:59:59",
+            }
+        ],
+    }
+    client = FakeClient({"activity/ak.json": payload, "activity/end.json": payload})
+    source = SraSource(client)
+
+    ak_activities = list(await source.fetch("arknights"))
+    end_activities = list(await source.fetch("endfield"))
+
+    assert client.calls[0].endswith("/ak.json")
+    assert client.calls[1].endswith("/end.json")
+    assert ak_activities[0].game_id == "arknights"
+    assert end_activities[0].game_id == "endfield"
+
+
+def test_sra_games_expose_arknights_and_endfield():
+    client = FakeClient()
+    source = SraSource(client)
+    ids = {game.game_id for game in source.games()}
+    assert {"arknights", "endfield"} <= ids

@@ -135,3 +135,15 @@ def test_template_editor_is_wired_to_its_endpoints():
     # 头像走页面目录里的 logo，不能引用插件根目录（会被 page_root 限制挡住）
     assert (PAGE_DIR / "logo.png").is_file()
     assert './' in js and "qq-avatar" in js
+
+
+def test_settings_panel_is_wired_to_its_endpoints():
+    """数据源 / 代理面板要连到后端两个接口，否则保存了也不生效。"""
+    html = read_html()
+    assert 'id="settings-button"' in html
+    assert 'id="settings-modal"' in html
+    assert 'id="settings-body"' in html
+
+    js = (PAGE_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'apiGet("settings")' in js
+    assert 'apiPost("settings-save"' in js

@@ -912,6 +912,216 @@ templateState.elements.modal.addEventListener("click", (event) => {
   if (event.target === templateState.elements.modal) closeTemplate();
 });
 
+// ---- 数据源与代理设置 ----
+
+const SOURCE_HINTS = {
+  sra: "境外站点，建议走代理",
+  akedata: "国内站点，走直连更快",
+  prts: "国内站点，走直连更快",
+};
+
+const settingsState = {
+  sources: [],
+  gameSources: [],
+  network: { proxy: "", direct_hosts: "", default_direct_hosts: "" },
+  initial: null,
+  elements: {
+    button: document.getElementById("settings-button"),
+    modal: document.getElementById("settings-modal"),
+    close: document.getElementById("settings-close"),
+    body: document.getElementById("settings-body"),
+    note: document.getElementById("settings-note"),
+    reset: document.getElementById("settings-reset"),
+    save: document.getElementById("settings-save"),
+  },
+};
+
+function setSettingsNote(message = "", isError = false) {
+  settingsState.elements.note.textContent = message;
+  settingsState.elements.note.classList.toggle("is-error", isError);
+}
+
+function renderSettings() {
+  const sourceItems = settingsState.sources
+    .map((source) =>
+      [
+        '<label class="toggle tmpl-toggle">',
+        '  <input type="checkbox" data-settings-source="' +
+          escapeHtml(source.id) +
+          '"' +
+          (source.enabled ? " checked" : "") +
+          " />",
+        '  <span class="tmpl-toggle-text">',
+        "    <strong>" + escapeHtml(source.name) + "</strong>",
+        '    <span class="field-hint">' +
+          escapeHtml(SOURCE_HINTS[source.id] || "数据源开关") +
+          "</span>",
+        "  </span>",
+        "</label>",
+      ].join(""),
+    )
+    .join("");
+
+  const gameItems = settingsState.gameSources
+    .map((game) => {
+      const options = game.options
+        .map(
+          (option) =>
+            '<option value="' +
+            escapeHtml(option.id) +
+            '"' +
+            (option.id === game.source_id ? " selected" : "") +
+            ">" +
+            escapeHtml(option.name) +
+            (option.enabled ? "" : "（已关闭）") +
+            "</option>",
+        )
+        .join("");
+      return [
+        '<div class="field-group">',
+        '  <label class="field-label">' +
+          escapeHtml(game.name) +
+          " 的数据源</label>",
+        '  <select data-settings-game="' + escapeHtml(game.game_id) + '">' +
+          options +
+          "</select>",
+        '  <span class="field-hint">当前生效：' +
+          escapeHtml(game.current || "（无可用数据源）") +
+          "</span>",
+        "</div>",
+      ].join("");
+    })
+    .join("");
+
+  const network = settingsState.network || {};
+  const networkItems = [
+    '<div class="field-group">',
+    '  <label class="field-label">代理地址</label>',
+    '  <input type="text" id="settings-proxy" value="' +
+      escapeHtml(network.proxy || "") +
+      '" placeholder="http://127.0.0.1:7890" />',
+    '  <span class="field-hint">留空表示不使用代理；支持 http / socks5。</span>',
+    "</div>",
+    '<div class="field-group">',
+    '  <label class="field-label">直连域名</label>',
+    '  <textarea id="settings-direct" rows="3" placeholder="' +
+      escapeHtml(network.default_direct_hosts || "") +
+      '">' +
+      escapeHtml(network.direct_hosts || "") +
+      "</textarea>",
+    '  <span class="field-hint">这些域名即使配了代理也直连；清空表示全部走代理。</span>',
+    "</div>",
+  ].join("");
+
+  settingsState.elements.body.innerHTML = [
+    '<section class="tmpl-group">',
+    '  <h3 class="tmpl-group-title">数据源</h3>',
+    sourceItems,
+    '  <p class="field-hint">至少要保留一个数据源；关掉某个源会同时移除它提供的游戏。</p>',
+    "</section>",
+    gameItems ? '<section class="tmpl-group">' : "",
+    gameItems ? '  <h3 class="tmpl-group-title">同一游戏用哪个源</h3>' : "",
+    gameItems,
+    gameItems ? "</section>" : "",
+    '<section class="tmpl-group">',
+    '  <h3 class="tmpl-group-title">网络</h3>',
+    networkItems,
+    "</section>",
+  ].join("");
+}
+
+function collectSettings() {
+  const enabled = {};
+  settingsState.elements.body
+    .querySelectorAll("[data-settings-source]")
+    .forEach((node) => {
+      enabled[node.dataset.settingsSource] = node.checked;
+    });
+  const gameSources = {};
+  settingsState.elements.body
+    .querySelectorAll("[data-settings-game]")
+    .forEach((node) => {
+      gameSources[node.dataset.settingsGame] = node.value;
+    });
+  const proxyNode = document.getElementById("settings-proxy");
+  const directNode = document.getElementById("settings-direct");
+  return {
+    enabled,
+    game_sources: gameSources,
+    proxy: proxyNode ? proxyNode.value : "",
+    direct_hosts: directNode ? directNode.value : "",
+  };
+}
+
+function applySettings(data) {
+  settingsState.sources = (data && data.sources) || [];
+  settingsState.gameSources = (data && data.game_sources) || [];
+  settingsState.network = (data && data.network) || {};
+  renderSettings();
+}
+
+async function openSettings() {
+  if (!bridge) return;
+  settingsState.elements.modal.classList.remove("is-hidden");
+  setSettingsNote("正在读取当前设置…");
+  try {
+    const data = await bridge.apiGet("settings");
+    applySettings(data);
+    settingsState.initial = collectSettings();
+    setSettingsNote("");
+  } catch (error) {
+    setSettingsNote(
+      error && error.message ? error.message : "读取设置失败",
+      true,
+    );
+  }
+}
+
+function closeSettings() {
+  settingsState.elements.modal.classList.add("is-hidden");
+}
+
+async function resetSettings() {
+  if (!bridge) return;
+  try {
+    const data = await bridge.apiGet("settings");
+    applySettings(data);
+    settingsState.initial = collectSettings();
+    showToast("已还原为当前生效的设置");
+    setSettingsNote("");
+  } catch (error) {
+    setSettingsNote(
+      error && error.message ? error.message : "读取设置失败",
+      true,
+    );
+  }
+}
+
+async function saveSettings() {
+  if (!bridge) return;
+  const payload = collectSettings();
+  settingsState.elements.save.classList.add("is-loading");
+  try {
+    const result = await bridge.apiPost("settings-save", payload);
+    applySettings(result);
+    setSettingsNote("");
+    showToast("数据源设置已保存并生效");
+    await loadOverview();
+  } catch (error) {
+    setSettingsNote(error && error.message ? error.message : "保存失败", true);
+  } finally {
+    settingsState.elements.save.classList.remove("is-loading");
+  }
+}
+
+settingsState.elements.button.addEventListener("click", openSettings);
+settingsState.elements.close.addEventListener("click", closeSettings);
+settingsState.elements.reset.addEventListener("click", resetSettings);
+settingsState.elements.save.addEventListener("click", saveSettings);
+settingsState.elements.modal.addEventListener("click", (event) => {
+  if (event.target === settingsState.elements.modal) closeSettings();
+});
+
 elements.refreshButton.addEventListener("click", () =>
   loadOverview({ announce: true }),
 );

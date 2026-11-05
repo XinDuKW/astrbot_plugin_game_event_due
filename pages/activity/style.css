@@ -571,6 +571,28 @@ select:disabled {
   font-size: 13px;
 }
 
+.modal-panel.is-narrow {
+  width: min(560px, 100%);
+}
+
+.modal-panel.is-narrow .modal-body {
+  display: block;
+  padding: 16px 18px 20px;
+  overflow-y: auto;
+}
+
+.settings-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.settings-body .field-group input[type="text"],
+.settings-body .field-group select,
+.settings-body .field-group textarea {
+  width: 100%;
+}
+
 .template-preview {
   padding: 16px;
   overflow-y: auto;

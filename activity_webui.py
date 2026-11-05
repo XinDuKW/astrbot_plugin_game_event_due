@@ -26,7 +26,7 @@ from .services.subscription_service import (
     resolve_message_settings,
     resolve_policy,
 )
-from .sources import GAME_TIMEZONE, Activity, Game
+from .sources import GAME_TIMEZONE, Activity, Game, normalize_direct_hosts
 
 PLUGIN_NAME = "astrbot_plugin_game_event_due"
 MESSAGE_TYPES = {"GroupMessage", "FriendMessage", "OtherMessage"}
@@ -52,6 +52,8 @@ class ActivityWebUIController:
             ("template-preview", self.template_preview, ["POST"], "按草稿模板预览排版"),
             ("template-save", self.template_save, ["POST"], "保存消息模板配置"),
             ("refresh", self.refresh, ["POST"], "立即执行一轮活动检查"),
+            ("settings", self.settings, ["GET"], "读取数据源与代理设置"),
+            ("settings-save", self.settings_save, ["POST"], "保存数据源与代理设置"),
         )
         for endpoint, handler, methods, description in routes:
             self.context.register_web_api(
@@ -657,3 +659,117 @@ class ActivityWebUIController:
 
         self.plugin.reload_message_settings()
         return json_response({"saved": True, "values": self.plugin.message_format_values()})
+
+    # ---- 数据源与网络设置 ----
+
+    PROXY_SCHEMES: tuple[str, ...] = (
+        "http://",
+        "https://",
+        "socks5://",
+        "socks5h://",
+    )
+
+    async def settings(self):
+        return json_response(self.plugin.source_settings_values())
+
+    async def settings_save(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求内容必须是 JSON 对象", status_code=400)
+
+        config = self.plugin.config
+        current_sources = config.get("sources")
+        current_sources = (
+            dict(current_sources) if isinstance(current_sources, dict) else {}
+        )
+        current_basic = config.get("basic")
+        current_basic = dict(current_basic) if isinstance(current_basic, dict) else {}
+
+        try:
+            sources_block, basic_block = self._draft_source_settings(
+                payload, current_sources, current_basic
+            )
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+
+        config["sources"] = {**current_sources, **sources_block}
+        config["basic"] = {**current_basic, **basic_block}
+        try:
+            await self._save_plugin_config()
+        except Exception as exc:
+            logger.warning(f"保存数据源配置失败: {exc}")
+            return error_response(f"保存配置失败: {exc}", status_code=500)
+
+        try:
+            await self.plugin.reload_source_settings()
+        except Exception as exc:
+            logger.warning(f"应用数据源配置失败: {exc}")
+            return error_response(
+                f"配置已保存，但重新加载数据源失败: {exc}", status_code=500
+            )
+
+        return json_response({"saved": True, **self.plugin.source_settings_values()})
+
+    def _draft_source_settings(
+        self, payload: dict, current_sources: dict, current_basic: dict
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """校验并整理要写回配置的数据源 / 网络字段。"""
+        plugin = self.plugin
+        flags = {
+            "sra": self._read_bool(current_sources, "enable_sra", True),
+            "akedata": self._read_bool(current_sources, "enable_akedata", True),
+            "prts": self._read_bool(current_sources, "enable_prts", True),
+        }
+        raw_enabled = payload.get("enabled")
+        if isinstance(raw_enabled, dict):
+            for source_id in flags:
+                if source_id in raw_enabled:
+                    flags[source_id] = self._read_bool(
+                        raw_enabled, source_id, flags[source_id]
+                    )
+        if not any(flags.values()):
+            raise ValueError("至少要启用一个数据源")
+
+        block: dict[str, Any] = {
+            "enable_sra": flags["sra"],
+            "enable_akedata": flags["akedata"],
+            "enable_prts": flags["prts"],
+        }
+
+        raw_prefs = payload.get("game_sources")
+        raw_prefs = raw_prefs if isinstance(raw_prefs, dict) else {}
+        for game_id, choices in plugin.SOURCE_CHOICES.items():
+            if game_id in raw_prefs:
+                choice = str(raw_prefs[game_id] or "").strip().lower()
+                if choice not in choices:
+                    raise ValueError(f"{game_id} 不支持的数据源：{choice or '（空）'}")
+                if not flags[choice]:
+                    raise ValueError(
+                        f"{game_id} 选的数据源（{plugin.SOURCE_LABELS[choice]}）未启用"
+                    )
+            else:
+                saved = str(current_sources.get(f"{game_id}_source") or choices[0])
+                choice = saved.strip().lower()
+                if choice not in choices or not flags[choice]:
+                    choice = next(
+                        (item for item in choices if flags[item]), choices[0]
+                    )
+            block[f"{game_id}_source"] = choice
+
+        proxy = str(
+            payload.get("proxy", current_basic.get("proxy", "")) or ""
+        ).strip()
+        if proxy and not proxy.lower().startswith(self.PROXY_SCHEMES):
+            raise ValueError(
+                "代理地址要以 http:// 或 socks5:// 开头；留空表示不使用代理"
+            )
+        direct_raw = payload.get("direct_hosts", current_basic.get("direct_hosts"))
+        if direct_raw is None:
+            direct_raw = ""
+        direct_hosts = normalize_direct_hosts(direct_raw)
+
+        return block, {
+            "proxy": proxy,
+            "direct_hosts": ", ".join(direct_hosts),
+        }
+

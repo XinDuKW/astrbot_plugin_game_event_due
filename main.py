@@ -169,6 +169,7 @@ class GameActivityPlugin(Star):
             self._cfg_int("sources", "prts_min_request_interval_seconds", 20),
         )
         self.prts_past_days = max(0, self._cfg_int("sources", "prts_past_days", 7))
+        self.game_source_prefs = self._resolve_source_prefs()
 
         self.default_policy = ReminderPolicy(
             thresholds=normalize_thresholds(
@@ -208,7 +209,9 @@ class GameActivityPlugin(Star):
             cache_dir=self.cache_dir,
             direct_hosts=self.direct_hosts,
         )
-        self.registry = GameRegistry(self._build_sources())
+        self.registry = GameRegistry(
+            self._build_sources(), preferred=self.game_source_prefs
+        )
         if not self.registry.games:
             logger.warning(
                 "所有数据源均已关闭，插件不会提供任何游戏。"
@@ -418,6 +421,28 @@ class GameActivityPlugin(Star):
             logger.warning(f"无法获取插件数据目录，缓存已禁用: {exc}")
             return None
 
+    # 同一款游戏有多个来源时，可选的来源（第一项是默认值）
+    SOURCE_CHOICES: dict[str, tuple[str, ...]] = {
+        "arknights": ("prts", "sra"),
+        "endfield": ("akedata", "sra"),
+    }
+
+    # 数据源的人类可读名称（管理页与日志共用）
+    SOURCE_LABELS: dict[str, str] = {
+        "sra": "SRA 公共 API",
+        "akedata": "AKEData（终末地配置表）",
+        "prts": "PRTS（明日方舟 Wiki）",
+    }
+
+    def _resolve_source_prefs(self) -> dict[str, str]:
+        """读取「同一游戏用哪个数据源」的偏好；非法值回退到默认来源。"""
+        prefs: dict[str, str] = {}
+        for game_id, choices in self.SOURCE_CHOICES.items():
+            default = choices[0]
+            raw = self._cfg_str("sources", f"{game_id}_source", default).strip().lower()
+            prefs[game_id] = raw if raw in choices else default
+        return prefs
+
     def _build_sources(self) -> list[Any]:
         sources: list[Any] = []
         if self.enable_sra:
@@ -443,6 +468,105 @@ class GameActivityPlugin(Star):
                 )
             )
         return sources
+
+    # ---- 数据源与网络设置（管理页可编辑） ----
+
+    def _source_enabled_flags(self) -> dict[str, bool]:
+        return {
+            "sra": self.enable_sra,
+            "akedata": self.enable_akedata,
+            "prts": self.enable_prts,
+        }
+
+    def _reload_source_config(self) -> None:
+        """从 config 重读数据源与网络字段（不重建任何客户端）。"""
+        self.proxy = str(self._cfg_str("basic", "proxy", "") or "").strip()
+        self.direct_hosts = normalize_direct_hosts(
+            self._cfg("basic", "direct_hosts", ", ".join(DEFAULT_DIRECT_HOSTS))
+        )
+        self.enable_sra = self._cfg_bool("sources", "enable_sra", True)
+        self.enable_akedata = self._cfg_bool("sources", "enable_akedata", True)
+        self.enable_prts = self._cfg_bool("sources", "enable_prts", True)
+        self.game_source_prefs = self._resolve_source_prefs()
+
+    def _rebuild_registry(self) -> None:
+        """按当前开关重建注册表，并让轮询服务改用它。"""
+        self.registry = GameRegistry(
+            self._build_sources(), preferred=self.game_source_prefs
+        )
+        self.polling.registry = self.registry
+
+    async def reload_source_settings(self) -> None:
+        """热应用数据源 / 代理改动，无需重启 AstrBot。"""
+        self._reload_source_config()
+        await self.http_client.close()
+        self.http_client = JsonHttpClient(
+            proxy=self.proxy or None,
+            timeout=float(self.request_timeout),
+            cache_dir=self.cache_dir,
+            direct_hosts=self.direct_hosts,
+        )
+        self._rebuild_registry()
+        self.polling.invalidate_memo()
+        self.cover_resolver.proxy = self.proxy or None
+        self.cover_resolver.direct_hosts = self.direct_hosts
+        await self.cover_resolver.close()
+        self.cover_resolver.clear_cache()
+        enabled = [
+            label
+            for source_id, label in self.SOURCE_LABELS.items()
+            if self._source_enabled_flags()[source_id]
+        ]
+        logger.info(
+            "数据源设置已更新：启用 "
+            f"{' / '.join(enabled) or '（无）'}；代理 "
+            f"{self.proxy or '未设置'}；直连 "
+            f"{', '.join(self.direct_hosts) or '（无）'}"
+        )
+
+    def _current_source_id(self, game_id: str) -> str:
+        source = self.registry.source_for(game_id)
+        return source.source_id if source else ""
+
+    def source_settings_values(self) -> dict[str, Any]:
+        """给管理页用的数据源 / 网络设置快照。"""
+        enabled = self._source_enabled_flags()
+        sources = [
+            {
+                "id": source_id,
+                "name": self.SOURCE_LABELS[source_id],
+                "enabled": enabled[source_id],
+            }
+            for source_id in ("sra", "akedata", "prts")
+        ]
+        game_sources: list[dict[str, Any]] = []
+        for game_id, choices in self.SOURCE_CHOICES.items():
+            game = self.registry.get(game_id)
+            game_sources.append(
+                {
+                    "game_id": game_id,
+                    "name": game.name if game else game_id,
+                    "current": self.registry.source_name(game_id),
+                    "source_id": self._current_source_id(game_id),
+                    "options": [
+                        {
+                            "id": choice,
+                            "name": self.SOURCE_LABELS[choice],
+                            "enabled": enabled[choice],
+                        }
+                        for choice in choices
+                    ],
+                }
+            )
+        return {
+            "sources": sources,
+            "game_sources": game_sources,
+            "network": {
+                "proxy": self.proxy,
+                "direct_hosts": ", ".join(self.direct_hosts),
+                "default_direct_hosts": ", ".join(DEFAULT_DIRECT_HOSTS),
+            },
+        }
 
     # ---- KV 委托 ----
 
@@ -872,6 +996,10 @@ class GameActivityPlugin(Star):
                 shown = display_game_name(game, self.message_settings)
                 aliases = "/".join(str(alias) for alias in game.aliases[:5])
                 suffix = f"，别名：{aliases}" if aliases else ""
+                options = self.registry.source_options(game.game_id)
+                if options:
+                    choices = "/".join(source.source_id for source in options)
+                    suffix += f"，可切换：{choices}"
                 lines.append(f"• {shown}（{game.game_id}{suffix}）")
             lines.append("")
         lines.append("用法: /活动订阅 <游戏名或代号>")
@@ -1142,6 +1270,17 @@ class GameActivityPlugin(Star):
                 source_id
             ]
             lines.append(f"{mark} {label}: {note}")
+
+        for game_id in self.SOURCE_CHOICES:
+            game = self.registry.get(game_id)
+            options = self.registry.source_options(game_id)
+            if game is None or not options:
+                continue
+            names = "、".join(source.display_name for source in options)
+            lines.append(
+                f"🔀 {game.name}: {self.registry.source_name(game_id)}"
+                f"（可选 {names}）"
+            )
         return lines
 
     @filter.permission_type(filter.PermissionType.ADMIN)
