@@ -128,6 +128,19 @@ class ActivityDeliveryService:
 
     # ---- 发送项 → 消息链 ----
 
+    async def items_of(
+        self,
+        parts: Sequence[MessagePart],
+        settings: MessageSettings | None = None,
+    ) -> list[SendItem]:
+        """决定每个片段怎么发：封面下载/压缩失败时整体降级为文字 + 链接。"""
+        effective = settings or self.settings
+        try:
+            return await self.resolve_parts(parts, effective)
+        except Exception as exc:
+            logger.warning(f"封面解析失败，改为只发文字与封面链接: {exc}")
+            return self._text_only(parts)
+
     @staticmethod
     def _build_image(item: SendItem) -> Any | None:
         try:
@@ -247,29 +260,24 @@ class ActivityDeliveryService:
     ) -> bool:
         """紧急私聊提醒的合并转发：标题节点 + 每个活动一个节点。
 
-        第一个节点是「N 个活动马上就要结束了！」+ 各游戏分布（单游戏也显示），
+        标题拆成两个节点：「N 个活动马上就要结束了！」和「各游戏分布 + 停止提醒
+        的说明」。转发卡片每个节点只显示一行，拆开才看得到催的是哪几个游戏。
         之后每个活动各占一个节点，节点名是该游戏的简称。
         """
         if not groups:
             return True
         node_name = node_name or settings.forward_node_name or NODE_NAME
         head, _, summary = title.partition("\n")
-        headline = f"{head}\n{summary}" if summary else head
-        if ack_hint:
-            headline = f"{headline}\n\n{ack_hint}"
+        tail = f"{summary}\n\n{ack_hint}" if ack_hint else summary
         nodes: list[tuple[str, Sequence[Any]]] = [
-            (node_name, self._plain_chain(headline))
+            (node_name, self._plain_chain(head))
         ]
+        if tail:
+            nodes.append((node_name, self._plain_chain(tail)))
         for group in groups:
             for activity in group.activities:
                 block = build_activity_block(activity, (), now, settings)
-                try:
-                    items = await self.resolve_parts(block, settings)
-                except Exception as exc:
-                    logger.warning(
-                        f"封面解析失败，改为只发文字与封面链接: {exc}"
-                    )
-                    items = self._text_only(block)
+                items = await self.items_of(block, settings)
                 nodes.append((group.short, self.build_chain(items)))
 
         chain = self.build_forward_chain_named(nodes)
@@ -303,12 +311,9 @@ class ActivityDeliveryService:
             (node_name, self._plain_chain(header))
         ]
         for block in blocks:
-            try:
-                items = await self.resolve_parts(block, settings)
-            except Exception as exc:
-                logger.warning(f"封面解析失败，改为只发文字与封面链接: {exc}")
-                items = self._text_only(block)
-            nodes.append((node_name, self.build_chain(items)))
+            nodes.append(
+                (node_name, self.build_chain(await self.items_of(block, settings)))
+            )
         return self.build_forward_chain_named(nodes)
 
     async def build_event_chain(
@@ -357,12 +362,7 @@ class ActivityDeliveryService:
             parts = build_activity_block(
                 plan.activity, plan.reasons, now, settings
             )
-            try:
-                items = await self.resolve_parts(parts, settings)
-            except Exception as exc:
-                logger.warning(f"封面解析失败，改为只发文字与封面链接: {exc}")
-                items = self._text_only(parts)
-            chain = self.build_chain(items)
+            chain = self.build_chain(await self.items_of(parts, settings))
             if chain:
                 chains.append(chain)
         return chains
@@ -435,11 +435,7 @@ class ActivityDeliveryService:
             return True
 
         effective = settings or self.settings
-        try:
-            items = await self.resolve_parts(parts, effective)
-        except Exception as exc:
-            logger.warning(f"封面解析失败，改为只发文字与封面链接: {exc}")
-            items = self._text_only(parts)
+        items = await self.items_of(parts, effective)
 
         if await self._try_send(
             umo,

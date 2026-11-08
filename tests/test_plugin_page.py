@@ -147,3 +147,42 @@ def test_settings_panel_is_wired_to_its_endpoints():
     js = (PAGE_DIR / "app.js").read_text(encoding="utf-8")
     assert 'apiGet("settings")' in js
     assert 'apiPost("settings-save"' in js
+
+
+def test_urgent_panel_is_wired_to_its_endpoints():
+    """紧急提醒管理面板要连到后端两个接口，否则打开就是空白。"""
+    html = read_html()
+    assert 'id="urgent-button"' in html
+    assert 'id="urgent-modal"' in html
+    assert 'id="urgent-list"' in html
+    assert 'id="urgent-new-umo"' in html
+
+    js = (PAGE_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'apiGet("urgent-targets")' in js
+    assert 'apiPost("urgent-save"' in js
+
+
+def test_template_preview_points_to_urgent_section():
+    """紧急提醒预览在预览区下方，必须有引导，不然用户根本不知道要往下滑。"""
+    js = (PAGE_DIR / "app.js").read_text(encoding="utf-8")
+    assert 'data-tmpl-jump="urgent"' in js
+    assert 'id="tmpl-scroll-hint"' in js
+    assert "scrollTemplateToUrgent" in js
+    assert "updateTemplateScrollHint" in js
+    # 引导条要真的隐藏/显示，而不是一直挂着
+    assert 'classList.toggle("is-hidden"' in js
+
+def test_urgent_panel_folds_long_activity_lists():
+    """活动记录会越堆越多，超过 5 条要折叠，不能把卡片撑成一整屏。"""
+    js = (PAGE_DIR / "app.js").read_text(encoding="utf-8")
+    assert "URGENT_ACTIVITY_LIMIT = 5" in js
+    assert "class=\"urgent-more\"" in js
+    assert "restItems" in js and "restActivities" in js
+
+
+def test_urgent_remove_does_not_rely_on_window_confirm():
+    """插件页在 iframe 里，window.confirm 可能被静默拦掉，点了像没反应。"""
+    js = (PAGE_DIR / "app.js").read_text(encoding="utf-8")
+    assert "window.confirm(" not in js
+    assert "armUrgentRemove" in js
+    assert "再点一次移除" in js

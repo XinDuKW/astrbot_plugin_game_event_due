@@ -16,7 +16,7 @@ import asyncio
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
-from collections.abc import Awaitable, Callable, Iterable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 
 from ..sources.base import Activity, GAME_TIMEZONE, parse_datetime
 from .message_formatter import COVER_MODES, MessageSettings
@@ -27,7 +27,12 @@ from .reminder_service import (
     normalize_keywords,
     normalize_thresholds,
 )
-from .urgent_dm_service import UrgentTargetState, mark_acked
+from .urgent_dm_service import (
+    TARGET_SETTING_KEYS,
+    UrgentTargetState,
+    clamp_setting,
+    mark_acked,
+)
 
 SUBSCRIPTIONS_KEY = "game_event_due_subscriptions_v1"
 NOTIFY_STATE_KEY = "game_event_due_notify_state_v1"
@@ -465,7 +470,7 @@ class SubscriptionService:
                         payload["end"] = end_value
                     if payload:
                         activities[str(uid)] = payload
-            result[key] = {
+            record: dict[str, Any] = {
                 "enabled": bool(entry.get("enabled", True)),
                 "games": [
                     str(game).strip()
@@ -475,6 +480,16 @@ class SubscriptionService:
                 "note": str(entry.get("note") or ""),
                 "activities": activities,
             }
+            settings: dict[str, int] = {}
+            raw_settings = entry.get("settings")
+            if isinstance(raw_settings, Mapping):
+                for name in TARGET_SETTING_KEYS:
+                    number = clamp_setting(name, raw_settings.get(name))
+                    if number is not None:
+                        settings[name] = number
+            if settings:
+                record["settings"] = settings
+            result[key] = record
         return result
 
     async def save_urgent_dm(self, data: dict[str, dict[str, Any]]) -> None:
@@ -492,6 +507,7 @@ class SubscriptionService:
         enabled: bool = True,
         games: list[str] | None = None,
         note: str = "",
+        settings: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """新增或更新一个私聊提醒目标，返回该目标的记录。"""
         entry = data.get(umo)
@@ -506,6 +522,43 @@ class SubscriptionService:
         entry.setdefault("games", [])
         entry.setdefault("note", "")
         entry.setdefault("activities", {})
+        if settings is not None:
+            SubscriptionService.update_urgent_settings(data, umo, settings)
+        return entry
+
+    @staticmethod
+    def update_urgent_settings(
+        data: dict[str, dict[str, Any]],
+        umo: str,
+        patch: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """合并某个目标的提醒节奏；patch 里值为 None 表示删掉那一项。
+
+        只认 trigger_days / repeat_minutes / daily_limit，其余键直接忽略，
+        免得旧版本或手改过的 KV 把脏数据带进来。全部清空时连 settings 一起删掉，
+        记录就回到「完全跟随全局」的状态。
+        """
+        entry = data.get(umo)
+        if not isinstance(entry, dict):
+            return None
+        current: dict[str, int] = {}
+        for name in TARGET_SETTING_KEYS:
+            number = clamp_setting(name, (entry.get("settings") or {}).get(name))
+            if number is not None:
+                current[name] = number
+        for name, value in patch.items():
+            if name not in TARGET_SETTING_KEYS:
+                continue
+            if value is None:
+                current.pop(name, None)
+                continue
+            number = clamp_setting(name, value)
+            if number is not None:
+                current[name] = number
+        if current:
+            entry["settings"] = current
+        else:
+            entry.pop("settings", None)
         return entry
 
     @staticmethod

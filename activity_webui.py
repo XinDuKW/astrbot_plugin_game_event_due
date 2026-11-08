@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
@@ -14,17 +15,36 @@ from .services.message_formatter import (
     COVER_MODES,
     DEFAULT_FORWARD_NODE_NAME,
     build_overview_message,
-    build_template_preview,
-    format_game_pairs,
-    format_urgency_rules,
     normalize_game_aliases,
     normalize_game_short_names,
     parse_urgency_rules,
 )
+from .services.template_preview import (
+    build_template_preview,
+    build_urgent_preview,
+    format_game_pairs,
+    format_urgency_rules,
+)
 from .services.reminder_service import normalize_keywords, normalize_thresholds
 from .services.subscription_service import (
+    SubscriptionService,
     resolve_message_settings,
     resolve_policy,
+)
+from .services.urgent_dm_service import (
+    MAX_DAILY_LIMIT,
+    MAX_REPEAT_MINUTES,
+    MAX_TRIGGER_DAYS,
+    MIN_DAILY_LIMIT,
+    MIN_REPEAT_MINUTES,
+    MIN_TRIGGER_DAYS,
+    SETTING_LIMIT,
+    SETTING_REPEAT,
+    SETTING_TRIGGER,
+    TARGET_SETTING_KEYS,
+    clamp_setting,
+    describe_target_settings,
+    target_settings,
 )
 from .sources import GAME_TIMEZONE, Activity, Game, normalize_direct_hosts
 
@@ -54,6 +74,8 @@ class ActivityWebUIController:
             ("refresh", self.refresh, ["POST"], "立即执行一轮活动检查"),
             ("settings", self.settings, ["GET"], "读取数据源与代理设置"),
             ("settings-save", self.settings_save, ["POST"], "保存数据源与代理设置"),
+            ("urgent-targets", self.urgent_targets, ["GET"], "读取紧急私聊提醒配置"),
+            ("urgent-save", self.urgent_save, ["POST"], "保存紧急私聊提醒配置"),
         )
         for endpoint, handler, methods, description in routes:
             self.context.register_web_api(
@@ -409,6 +431,175 @@ class ActivityWebUIController:
             }
         )
 
+    # ---- 紧急私聊提醒 ----
+
+    @staticmethod
+    def _urgent_limits() -> dict[str, list[int]]:
+        return {
+            SETTING_TRIGGER: [MIN_TRIGGER_DAYS, MAX_TRIGGER_DAYS],
+            SETTING_REPEAT: [MIN_REPEAT_MINUTES, MAX_REPEAT_MINUTES],
+            SETTING_LIMIT: [MIN_DAILY_LIMIT, MAX_DAILY_LIMIT],
+        }
+
+    async def urgent_targets(self):
+        try:
+            return json_response(await self._build_urgent_overview())
+        except Exception as exc:
+            logger.error(f"读取紧急提醒配置失败: {exc}")
+            return error_response("读取紧急提醒配置失败", status_code=500)
+
+    async def _build_urgent_overview(self) -> dict[str, Any]:
+        plugin = self.plugin
+        data = await plugin.subscriptions.get_urgent_dm()
+        base = plugin.urgent_dm
+
+        rows: list[dict[str, Any]] = []
+        for umo, entry in data.items():
+            parsed = self._parse_umo(umo)
+            message_type, session_id = (parsed[1], parsed[2]) if parsed else ("", umo)
+            effective = target_settings(base, entry)
+            activities = [
+                state
+                for state in (entry.get("activities") or {}).values()
+                if isinstance(state, dict)
+            ]
+            activities.sort(key=lambda item: str(item.get("end") or ""))
+            rows.append(
+                {
+                    "umo": umo,
+                    "session_id": session_id,
+                    "session_name": self._session_label(message_type, session_id, {}),
+                    "enabled": bool(entry.get("enabled", True)),
+                    "games": list(entry.get("games") or []),
+                    "note": str(entry.get("note") or ""),
+                    "settings": dict(entry.get("settings") or {}),
+                    "effective": {
+                        SETTING_TRIGGER: effective.trigger_days,
+                        SETTING_REPEAT: effective.repeat_minutes,
+                        SETTING_LIMIT: effective.daily_limit,
+                    },
+                    "describe": describe_target_settings(effective),
+                    "activities": [
+                        {
+                            "activity_id": str(state.get("activity_id") or ""),
+                            "name": str(state.get("name") or ""),
+                            "end": str(state.get("end") or ""),
+                            "acked": bool(state.get("acked")),
+                            "sent_total": int(state.get("sent_total") or 0),
+                            "last_sent_at": str(state.get("last_sent_at") or ""),
+                        }
+                        for state in activities
+                    ],
+                }
+            )
+
+        rows.sort(key=lambda row: str(row["session_id"]))
+        quiet_start, quiet_end = base.quiet_hours
+        return {
+            "enabled": bool(base.enabled),
+            "defaults": {
+                SETTING_TRIGGER: base.trigger_days,
+                SETTING_REPEAT: base.repeat_minutes,
+                SETTING_LIMIT: base.daily_limit,
+                "quiet_hours": f"{quiet_start}-{quiet_end}",
+                "ack_keywords": list(base.ack_keywords),
+                "games": list(base.games),
+            },
+            "limits": self._urgent_limits(),
+            "games": [
+                {"id": game.game_id, "name": game.name}
+                for game in plugin.registry.ordered()
+            ],
+            "targets": rows,
+        }
+
+    async def urgent_save(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求内容必须是 JSON 对象", status_code=400)
+
+        umo = payload.get("umo")
+        if self._parse_umo(umo) is None:
+            return error_response("私聊 UMO 格式不正确", status_code=400)
+
+        plugin = self.plugin
+        data = await plugin.subscriptions.get_urgent_dm()
+        entry = data.get(umo) or {}
+
+        if payload.get("remove"):
+            if not SubscriptionService.remove_urgent_target(data, umo):
+                return error_response("没有找到这个提醒目标", status_code=404)
+            await plugin.subscriptions.save_urgent_dm(data)
+            return json_response(await self._build_urgent_overview())
+
+        if payload.get("reset_ack"):
+            target_id = str(payload.get("activity_id") or "").strip()
+            states = entry.get("activities") if isinstance(entry, dict) else None
+            if not isinstance(states, dict) or not states:
+                return error_response("这个目标还没有被提醒过的活动", status_code=404)
+            cleared = 0
+            for uid, state in states.items():
+                if target_id and uid != target_id:
+                    continue
+                if isinstance(state, dict) and state.get("acked"):
+                    state["acked"] = False
+                    state.pop("ack_at", None)
+                    cleared += 1
+            if not cleared:
+                return error_response("没有需要解除的活动", status_code=404)
+            await plugin.subscriptions.save_urgent_dm(data)
+            return json_response(await self._build_urgent_overview())
+
+        games: list[str] | None = None
+        if "games" in payload:
+            raw_games = payload.get("games")
+            if not isinstance(raw_games, list):
+                return error_response("游戏列表格式不正确", status_code=400)
+            games = [str(game).strip() for game in raw_games if str(game).strip()]
+            unknown = [game for game in games if plugin.registry.get(game) is None]
+            if unknown:
+                return error_response(
+                    f"未知的游戏: {'、'.join(unknown)}", status_code=400
+                )
+
+        patch: dict[str, Any] = {}
+        raw_settings = payload.get("settings")
+        if isinstance(raw_settings, Mapping):
+            for key in TARGET_SETTING_KEYS:
+                if key not in raw_settings:
+                    continue
+                value = raw_settings[key]
+                if value is None or str(value).strip() == "":
+                    patch[key] = None
+                    continue
+                try:
+                    number = int(str(value).strip())
+                except (TypeError, ValueError):
+                    return error_response(f"{key} 必须是整数", status_code=400)
+                clamped = clamp_setting(key, number)
+                if clamped is None:
+                    low, high = self._urgent_limits()[key]
+                    return error_response(
+                        f"{key} 超出范围（{low}~{high}）", status_code=400
+                    )
+                patch[key] = clamped
+
+        if games is None and not patch and "enabled" not in payload:
+            return error_response("没有可保存的设置", status_code=400)
+
+        enabled = (
+            bool(payload.get("enabled"))
+            if "enabled" in payload
+            else bool(entry.get("enabled", True))
+        )
+        SubscriptionService.upsert_urgent_target(
+            data, umo, enabled=enabled, games=games, note=str(payload.get("note") or ""),
+        )
+        if patch:
+            SubscriptionService.update_urgent_settings(data, umo, patch)
+        await plugin.subscriptions.save_urgent_dm(data)
+        return json_response(await self._build_urgent_overview())
+
     # ---- 消息模板编辑器 ----
 
     @staticmethod
@@ -613,6 +804,16 @@ class ActivityWebUIController:
             source_name=self.plugin.registry.source_name(game.game_id),
         )
         preview["note"] = note
+        try:
+            urgent_count = int(payload.get("urgent_games", 3))
+        except (TypeError, ValueError):
+            urgent_count = 3
+        preview["urgent"] = build_urgent_preview(
+            self.plugin.registry.ordered(),
+            now,
+            settings,
+            count=urgent_count,
+        )
         return json_response(preview)
 
     async def template_save(self):

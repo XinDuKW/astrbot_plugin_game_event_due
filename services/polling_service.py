@@ -40,6 +40,7 @@ from .urgent_dm_service import (
     UrgentDmSettings,
     UrgentTargetState,
     mark_sent,
+    target_settings,
     urgent_activities,
 )
 
@@ -367,14 +368,18 @@ class ActivityPollingService:
         一个目标一条消息，消息里包含该目标本轮所有进入档位、且还没被确认的活动；
         只有真正送达才会写状态，失败留到下一轮重试。
         """
-        settings = self.settings.urgent_dm
+        base_settings = self.settings.urgent_dm
         dirty = False
 
         for umo, entry in targets.items():
+            # 每个人可以用 /活动私人提醒 设置 覆盖自己的触发档位与节奏
+            settings = target_settings(base_settings, entry)
             states = entry.get("activities") or {}
             game_ids = [
                 str(game).strip()
-                for game in (entry.get("games") or settings.games or tuple(fetched))
+                for game in (
+                    entry.get("games") or base_settings.games or tuple(fetched)
+                )
                 if str(game).strip()
             ]
             pending: list[Activity] = []

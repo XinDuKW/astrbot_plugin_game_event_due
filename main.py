@@ -35,11 +35,10 @@ from .services.message_formatter import (
     normalize_cover_mode,
     normalize_game_aliases,
     normalize_game_short_names,
-    format_game_pairs,
-    format_urgency_rules,
     parse_urgency_rules,
     short_game_name,
 )
+from .services.template_preview import format_game_pairs, format_urgency_rules
 from .services.polling_service import ActivityPollingService, PollingSettings
 from .services.reminder_service import ReminderPolicy, normalize_thresholds
 from .services.subscription_service import (
@@ -57,12 +56,16 @@ from .sources import (
     normalize_direct_hosts,
 )
 from .services.urgent_dm_service import (
+    TARGET_SETTING_KEYS,
     UrgentDmSettings,
+    describe_target_settings,
     is_ack_text,
     normalize_ack_keywords,
     normalize_games,
     normalize_targets,
     parse_quiet_hours,
+    parse_target_settings,
+    target_settings,
 )
 from .sources.registry import GameRegistry
 
@@ -79,6 +82,8 @@ USAGE_SUBSCRIBE = (
     "用法: /活动订阅 <游戏名> [游戏名 ...]\n"
     "可用游戏请查看 /活动游戏"
 )
+# 未订阅时统一提示：所有会话级指令都从这里取，避免各写一份又慢慢走样
+NO_SUBSCRIBE_TEXT = "当前会话没有订阅任何游戏\n" + USAGE_SUBSCRIBE
 USAGE_THRESHOLD = (
     "用法: /活动阈值 <天数...>\n"
     "例如 /活动阈值 7 3 1 表示剩余不足 7 天 / 3 天 / 24 小时各提醒一次；\n"
@@ -87,10 +92,16 @@ USAGE_THRESHOLD = (
 USAGE_URGENT_DM = (
     "用法:\n"
     "/活动私人提醒 @某人       把某人加入紧急私聊提醒（管理员）\n"
+    "/活动私人提醒 设置 @某人 3天 2小时 3次   单独设置某人的节奏（管理员）\n"
+    "/活动私人提醒 设置 3天 2小时 3次         在私聊里直接设置自己的\n"
     "/活动私人提醒 移除 @某人  把某人移出紧急提醒（管理员）\n"
-    "/活动私人提醒 列表        查看当前的提醒目标\n"
+    "/活动私人提醒 列表        查看提醒目标与各自的节奏\n"
     "/活动私人提醒 停止        停止对自己的紧急提醒\n"
     "/活动私人提醒 测试        给自己发一条测试私聊\n"
+    "设置的单位：3天=剩余不足 3 天就开始催，2小时=每 2 小时催一次，"
+    "3次=每天最多 3 次；\n"
+    "填「默认」恢复跟随全局配置。也可以直接贴 aiocqhttp:FriendMessage:123456 "
+    "这种会话号指定目标。\n"
     "被提醒的人回一句 /我已知晓 即可停止提醒；跟上活动名可以只停那一个。"
 )
 USAGE_FILTER = (
@@ -593,6 +604,11 @@ class GameActivityPlugin(Star):
 
     # ---- 通用辅助 ----
 
+    @staticmethod
+    def _args(event: AstrMessageEvent) -> list[str]:
+        """指令名之后的参数列表（不含指令本身）。"""
+        return event.message_str.strip().split()[1:]
+
     def _session_games(
         self,
         session: dict[str, Any] | None,
@@ -608,6 +624,15 @@ class GameActivityPlugin(Star):
             if game is not None:
                 games.append(game)
         return games, []
+
+    async def _patch_session(
+        self,
+        umo: str,
+        patch: dict[str, Any],
+        current: dict[str, Any],
+    ) -> dict[str, Any]:
+        """更新会话设置并返回最新会话；会话已不存在时沿用旧值。"""
+        return await self.subscriptions.update_session(umo, patch) or current
 
     @staticmethod
     def _format_policy(policy: ReminderPolicy) -> str:
@@ -662,7 +687,7 @@ class GameActivityPlugin(Star):
     @filter.command("活动订阅", alias={"game_sub", "活动关注"})
     async def subscribe_games(self, event: AstrMessageEvent):
         """订阅游戏活动，格式: /活动订阅 <游戏名> [游戏名 ...]。"""
-        tokens = event.message_str.strip().split()[1:]
+        tokens = self._args(event)
         if not tokens:
             yield event.plain_result(USAGE_SUBSCRIBE)
             return
@@ -689,7 +714,7 @@ class GameActivityPlugin(Star):
     @filter.command("活动退订", alias={"game_unsub", "活动取消订阅"})
     async def unsubscribe_games(self, event: AstrMessageEvent):
         """退订游戏活动，格式: /活动退订 <游戏名...> 或 /活动退订 全部。"""
-        tokens = event.message_str.strip().split()[1:]
+        tokens = self._args(event)
         umo = event.unified_msg_origin
         session = await self.subscriptions.get_session(umo)
         if not session:
@@ -739,7 +764,7 @@ class GameActivityPlugin(Star):
         )
         if not session:
             yield event.plain_result(
-                "当前会话没有订阅任何游戏\n" + USAGE_SUBSCRIBE
+                NO_SUBSCRIBE_TEXT
             )
             return
         yield event.plain_result(self._render_session_summary(session))
@@ -749,7 +774,7 @@ class GameActivityPlugin(Star):
         """查看当前活动，格式: /活动查询 [游戏名...]。"""
         umo = event.unified_msg_origin
         session = await self.subscriptions.get_session(umo)
-        tokens = event.message_str.strip().split()[1:]
+        tokens = self._args(event)
         games, unknown = self._session_games(session, tokens)
 
         if not games:
@@ -759,7 +784,7 @@ class GameActivityPlugin(Star):
                 )
             else:
                 yield event.plain_result(
-                    "当前会话没有订阅任何游戏\n" + USAGE_SUBSCRIBE
+                    NO_SUBSCRIBE_TEXT
                 )
             return
 
@@ -807,11 +832,11 @@ class GameActivityPlugin(Star):
         session = await self.subscriptions.get_session(umo)
         if not session:
             yield event.plain_result(
-                "当前会话没有订阅任何游戏\n" + USAGE_SUBSCRIBE
+                NO_SUBSCRIBE_TEXT
             )
             return
 
-        tokens = event.message_str.strip().split()[1:]
+        tokens = self._args(event)
         if not tokens:
             yield event.plain_result(
                 self._format_filters(session) + "\n\n" + USAGE_FILTER
@@ -820,11 +845,8 @@ class GameActivityPlugin(Star):
 
         action = tokens[0]
         if action in CLEAR_TOKENS:
-            session = (
-                await self.subscriptions.update_session(
-                    umo, {"whitelist": [], "blacklist": []}
-                )
-                or session
+            session = await self._patch_session(
+                umo, {"whitelist": [], "blacklist": []}, session
             )
             yield event.plain_result(
                 "✅ 已清空关键词过滤\n" + self._format_filters(session)
@@ -846,10 +868,7 @@ class GameActivityPlugin(Star):
             )
             return
 
-        session = (
-            await self.subscriptions.update_session(umo, {field: keywords})
-            or session
-        )
+        session = await self._patch_session(umo, {field: keywords}, session)
         label = "黑名单" if field == "blacklist" else "白名单"
         yield event.plain_result(
             f"✅ 已更新{label}: {'、'.join(keywords)}\n"
@@ -863,11 +882,11 @@ class GameActivityPlugin(Star):
         session = await self.subscriptions.get_session(umo)
         if not session:
             yield event.plain_result(
-                "当前会话没有订阅任何游戏\n" + USAGE_SUBSCRIBE
+                NO_SUBSCRIBE_TEXT
             )
             return
 
-        tokens = event.message_str.strip().split()[1:]
+        tokens = self._args(event)
         if not tokens:
             yield event.plain_result(self._format_cover_mode(session) + "\n\n" + USAGE_COVER)
             return
@@ -885,16 +904,13 @@ class GameActivityPlugin(Star):
             yield event.plain_result(USAGE_COVER)
             return
 
-        session = (
-            await self.subscriptions.update_session(umo, {"cover_mode": mode})
-            or session
-        )
+        session = await self._patch_session(umo, {"cover_mode": mode}, session)
         yield event.plain_result("✅ 已更新\n" + self._format_cover_mode(session))
 
     @filter.command("活动开关", alias={"game_toggle", "活动推送"})
     async def toggle_push(self, event: AstrMessageEvent):
         """开启或关闭当前会话的活动推送: /活动开关 开启|关闭。"""
-        tokens = event.message_str.strip().split()[1:]
+        tokens = self._args(event)
         if not tokens:
             yield event.plain_result("用法: /活动开关 开启 或 /活动开关 关闭")
             return
@@ -913,7 +929,7 @@ class GameActivityPlugin(Star):
         )
         if session is None:
             yield event.plain_result(
-                "当前会话没有订阅任何游戏\n" + USAGE_SUBSCRIBE
+                NO_SUBSCRIBE_TEXT
             )
             return
         yield event.plain_result(
@@ -927,11 +943,11 @@ class GameActivityPlugin(Star):
         session = await self.subscriptions.get_session(umo)
         if not session:
             yield event.plain_result(
-                "当前会话没有订阅任何游戏\n" + USAGE_SUBSCRIBE
+                NO_SUBSCRIBE_TEXT
             )
             return
 
-        tokens = event.message_str.strip().split()[1:]
+        tokens = self._args(event)
         if not tokens:
             policy = resolve_policy(session, self.default_policy)
             yield event.plain_result(
@@ -940,10 +956,7 @@ class GameActivityPlugin(Star):
             return
 
         if tokens[0] in RESET_TOKENS:
-            session = (
-                await self.subscriptions.update_session(umo, {"thresholds": None})
-                or session
-            )
+            session = await self._patch_session(umo, {"thresholds": None}, session)
             policy = resolve_policy(session, self.default_policy)
             yield event.plain_result(
                 "✅ 已恢复全局默认档位\n" + self._format_policy(policy)
@@ -951,10 +964,7 @@ class GameActivityPlugin(Star):
             return
 
         if tokens[0] in CLEAR_TOKENS or tokens[0] in OFF_TOKENS:
-            session = (
-                await self.subscriptions.update_session(umo, {"thresholds": []})
-                or session
-            )
+            session = await self._patch_session(umo, {"thresholds": []}, session)
             yield event.plain_result(
                 "✅ 已关闭倒计时提醒\n" + self._format_policy(resolve_policy(session, self.default_policy))
             )
@@ -965,11 +975,8 @@ class GameActivityPlugin(Star):
             yield event.plain_result(USAGE_THRESHOLD)
             return
 
-        session = (
-            await self.subscriptions.update_session(
-                umo, {"thresholds": list(thresholds)}
-            )
-            or session
+        session = await self._patch_session(
+            umo, {"thresholds": list(thresholds)}, session
         )
         yield event.plain_result(
             "✅ 已更新提醒档位\n"
@@ -1011,7 +1018,7 @@ class GameActivityPlugin(Star):
         """管理紧急私聊提醒目标: /活动私人提醒 @某人 | 移除 @某人 | 列表 | 停止 | 测试。"""
         umo = event.unified_msg_origin
         self_umo = self._self_private_umo(event)
-        tokens = event.message_str.strip().split()[1:]
+        tokens = self._args(event)
         action = tokens[0].lower() if tokens else "列表"
         is_admin = self._event_is_admin(event)
         now = datetime.now(GAME_TIMEZONE)
@@ -1025,13 +1032,16 @@ class GameActivityPlugin(Star):
                 if not is_admin and target != self_umo:
                     continue
                 games = "、".join(entry.get("games") or []) or "跟随订阅"
+                pace = describe_target_settings(
+                    target_settings(self.urgent_dm, entry)
+                )
                 pending = [
                     str(state.get("name") or uid)
                     for uid, state in (entry.get("activities") or {}).items()
                     if not state.get("acked")
                 ]
                 detail = f"，正在提醒：{'、'.join(pending)}" if pending else ""
-                lines.append(f"· {target}（{games}）{detail}")
+                lines.append(f"· {target}（{games}）{pace}{detail}")
             if not lines:
                 yield event.plain_result(
                     "当前没有紧急私聊提醒目标。\n\n" + USAGE_URGENT_DM
@@ -1068,6 +1078,42 @@ class GameActivityPlugin(Star):
         targets = self._mention_targets(event, umo)
         if not targets and "FriendMessage" in umo:
             targets = [umo]
+
+        if action in ("设置", "set", "配置"):
+            rest = tokens[1:]
+            pasted = [item for item in rest if self._is_umo_token(item)]
+            for item in pasted:
+                if item not in targets:
+                    targets.append(item)
+            if not targets:
+                yield event.plain_result(
+                    "请 @ 要设置的人，或者直接贴 平台:FriendMessage:QQ号。\n\n"
+                    + USAGE_URGENT_DM
+                )
+                return
+            if not is_admin and any(target != self_umo for target in targets):
+                yield event.plain_result("只有管理员可以给别人设置提醒节奏。")
+                return
+
+            parsed = parse_target_settings(
+                [item for item in rest if not self._is_umo_token(item)]
+            )
+            data = await self.subscriptions.get_urgent_dm()
+            for target in targets:
+                SubscriptionService.upsert_urgent_target(data, target, enabled=True)
+                patch = (
+                    dict.fromkeys(TARGET_SETTING_KEYS) if parsed is None else parsed
+                )
+                SubscriptionService.update_urgent_settings(data, target, patch)
+            await self.subscriptions.save_urgent_dm(data)
+
+            lines = [
+                f"· {target}｜"
+                f"{describe_target_settings(target_settings(self.urgent_dm, data.get(target)))}"
+                for target in targets
+            ]
+            yield event.plain_result("✅ 提醒节奏已更新:\n" + "\n".join(lines))
+            return
 
         if action in ("移除", "删除", "remove", "del"):
             if not targets:
@@ -1111,7 +1157,7 @@ class GameActivityPlugin(Star):
     @filter.command("我已知晓", alias={"活动已知晓", "game_ack", "已知晓"})
     async def ack_urgent_dm(self, event: AstrMessageEvent):
         """确认已知晓: /我已知晓 [活动名关键词]，停止对自己的紧急提醒。"""
-        tokens = event.message_str.strip().split()[1:]
+        tokens = self._args(event)
         acked = await self._ack_now(self._self_private_umo(event), tokens)
         if not acked:
             yield event.plain_result("当前没有对你生效的紧急提醒。")
@@ -1200,6 +1246,14 @@ class GameActivityPlugin(Star):
             except Exception:  # pragma: no cover - 取决于 AstrBot 版本
                 return False
         return False
+
+    @staticmethod
+    def _is_umo_token(token: str) -> bool:
+        """判断一个参数是不是 平台:FriendMessage:QQ号 形式的会话号。"""
+        parts = str(token or "").split(":")
+        if len(parts) < 3 or not all(part.strip() for part in parts[:3]):
+            return False
+        return not any("\u4e00" <= char <= "\u9fff" for char in str(token))
 
     @staticmethod
     def _mention_targets(event: AstrMessageEvent, umo: str) -> list[str]:

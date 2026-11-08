@@ -81,6 +81,85 @@ class StubLogger:
         self.records.clear()
 
 
+class StubPlain:
+    """``Comp.Plain`` 的替身：只保留 text。"""
+
+    def __init__(self, text: str = "") -> None:
+        self.text = text
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, StubPlain) and other.text == self.text
+
+    def __repr__(self) -> str:
+        return f"Plain({self.text!r})"
+
+
+class StubImage:
+    """``Comp.Image`` 的替身：记录 url 或压缩后的字节。"""
+
+    def __init__(self, url: str = "", data: bytes | None = None) -> None:
+        self.url = url
+        self.data = data
+
+    @classmethod
+    def fromURL(cls, url: str, *args: object, **kwargs: object) -> "StubImage":
+        return cls(url=url)
+
+    @classmethod
+    def fromBytes(cls, data: bytes, *args: object, **kwargs: object) -> "StubImage":
+        return cls(data=data)
+
+    def __repr__(self) -> str:
+        return f"Image({self.url or len(self.data or b'')}B)"
+
+
+class StubNode:
+    """``Comp.Node`` 的替身：转发节点的名字与内容。"""
+
+    def __init__(
+        self,
+        content: object = None,
+        name: str = "",
+        uin: str = "0",
+    ) -> None:
+        self.content = list(content or [])
+        self.name = name
+        self.uin = uin
+
+    def to_dict(self) -> dict:
+        return {
+            "type": "node",
+            "data": {
+                "uin": self.uin,
+                "name": self.name,
+                "content": [
+                    {"type": "text", "data": {"text": getattr(item, "text", "")}}
+                    for item in self.content
+                ],
+            },
+        }
+
+    def __repr__(self) -> str:
+        return f"Node({self.name!r}, {len(self.content)})"
+
+
+class StubNodes:
+    """``Comp.Nodes`` 的替身：一条合并转发。"""
+
+    def __init__(self, nodes: object = None) -> None:
+        self.nodes = list(nodes or [])
+
+    def __repr__(self) -> str:
+        return f"Nodes({len(self.nodes)})"
+
+
+class StubMessageChain:
+    """``MessageChain`` 的替身。"""
+
+    def __init__(self, chain: object = None, **kwargs: object) -> None:
+        self.chain = list(chain or [])
+
+
 STUB_LOGGER: StubLogger | None = None
 
 
@@ -97,13 +176,26 @@ def _install_astrbot_stub() -> None:
 
     stub = StubLogger()
 
+    components_module = types.ModuleType("astrbot.api.message_components")
+    components_module.Plain = StubPlain  # type: ignore[attr-defined]
+    components_module.Image = StubImage  # type: ignore[attr-defined]
+    components_module.Node = StubNode  # type: ignore[attr-defined]
+    components_module.Nodes = StubNodes  # type: ignore[attr-defined]
+
+    event_module = types.ModuleType("astrbot.api.event")
+    event_module.MessageChain = StubMessageChain  # type: ignore[attr-defined]
+
     astrbot_module = types.ModuleType("astrbot")
     api_module = types.ModuleType("astrbot.api")
     api_module.logger = stub  # type: ignore[attr-defined]
+    api_module.message_components = components_module  # type: ignore[attr-defined]
+    api_module.event = event_module  # type: ignore[attr-defined]
     astrbot_module.api = api_module  # type: ignore[attr-defined]
 
     sys.modules["astrbot"] = astrbot_module
     sys.modules["astrbot.api"] = api_module
+    sys.modules["astrbot.api.message_components"] = components_module
+    sys.modules["astrbot.api.event"] = event_module
     STUB_LOGGER = stub
 
 

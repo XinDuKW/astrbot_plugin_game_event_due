@@ -32,9 +32,6 @@ from astrbot_plugin_game_event_due.services.message_formatter import (
     build_urgent_dm_parts,
     build_urgent_dm_summary,
     build_urgent_dm_title,
-    build_template_preview,
-    format_game_pairs,
-    format_urgency_rules,
     normalize_cover_mode,
     normalize_game_aliases,
     parse_urgency_rules,
@@ -44,6 +41,12 @@ from astrbot_plugin_game_event_due.services.message_formatter import (
     urgency_level_for,
 )
 from astrbot_plugin_game_event_due.services.reminder_service import ReminderPlan
+from astrbot_plugin_game_event_due.services.template_preview import (
+    build_template_preview,
+    build_urgent_preview,
+    format_game_pairs,
+    format_urgency_rules,
+)
 from astrbot_plugin_game_event_due.sources.base import Activity, GAME_TIMEZONE
 from astrbot_plugin_game_event_due.sources.sra import SRA_GAMES
 
@@ -920,3 +923,48 @@ def test_template_preview_without_activities_explains_empty():
     assert [section["kind"] for section in preview["plain"]["sections"]] == ["note"]
     assert preview["forward"]["nodes"] == []
     assert preview["forward"]["footer"] == "查看 1 条转发消息"
+
+
+def test_urgent_preview_simulates_several_games_at_once():
+    preview = build_urgent_preview(SRA_GAMES, NOW, SETTINGS, count=3)
+
+    assert preview["count"] == 3
+    # 3 个游戏各 2 个活动，标题里的数字是活动数
+    assert "6 个活动马上就要结束了" in preview["headline"]
+    # 标题节点 + 游戏分布节点 + 每个活动一个节点
+    assert {node["name"] for node in preview["nodes"][:2]} == {
+        SETTINGS.forward_node_name
+    }
+    assert len(preview["nodes"]) == 2 + 6
+    assert {game["count"] for game in preview["games"]} == {2}
+    assert {node["name"] for node in preview["nodes"][2:]} == {
+        game["short"] for game in preview["games"]
+    }
+
+
+def test_urgent_preview_clamps_count_and_shows_every_colour():
+    preview = build_urgent_preview(SRA_GAMES, NOW, SETTINGS, count=99)
+
+    assert preview["count"] == 6
+    # 6 个游戏各一个活动，剩余时间抖动，四档颜色都应出现
+    assert len(preview["nodes"]) == 2 + 6
+    body = "\n".join(preview["plain_lines"])
+    for marker in ("🟥", "🟧", "🟩", "🟦"):
+        assert marker in body
+
+
+def test_urgent_preview_never_leaves_sample_activities_out():
+    preview = build_urgent_preview(SRA_GAMES[:2], NOW, SETTINGS, count=2)
+
+    assert preview["count"] == 2
+    assert len(preview["games"]) == 2
+    assert sum(game["count"] for game in preview["games"]) == 4
+    assert preview["ack_hint"] in "\n".join(preview["plain_lines"])
+
+
+def test_urgent_preview_without_games_returns_empty():
+    preview = build_urgent_preview([], NOW, SETTINGS, count=3)
+
+    assert preview["nodes"] == []
+    assert preview["games"] == []
+    assert preview["plain_lines"] == []

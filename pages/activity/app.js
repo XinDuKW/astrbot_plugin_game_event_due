@@ -70,6 +70,29 @@ function setSaving(saving) {
   });
 }
 
+// 插件页跑在 iframe 里，window.confirm 可能被静默拦掉（点了毫无反应），
+// 因此危险操作统一改成按钮内二次确认：第一次点变成「再点一次…」，
+// 4 秒内不跟就自动复原，避免误触。
+function armDangerButton(button, armedLabel, onConfirm) {
+  if (button.dataset.armed === "1") {
+    button.dataset.armed = "";
+    button.textContent = button.dataset.idleLabel || "移除";
+    button.classList.remove("is-armed");
+    onConfirm();
+    return;
+  }
+  button.dataset.idleLabel = button.textContent;
+  button.dataset.armed = "1";
+  button.textContent = armedLabel;
+  button.classList.add("is-armed");
+  window.setTimeout(() => {
+    if (!button.isConnected || button.dataset.armed !== "1") return;
+    button.dataset.armed = "";
+    button.textContent = button.dataset.idleLabel || "移除";
+    button.classList.remove("is-armed");
+  }, 4000);
+}
+
 function currentSession() {
   if (!state.overview) return null;
   const sessions = state.overview.sessions || [];
@@ -347,11 +370,12 @@ function renderDetail() {
 
   document
     .getElementById("remove-button")
-    .addEventListener("click", () => {
-      if (!window.confirm(`确定要移除「${session.session_name}」的全部活动订阅吗？`)) {
-        return;
-      }
-      post("session/remove", { umo: session.umo }, "已移除该会话的订阅");
+    .addEventListener("click", (event) => {
+      const button = event.currentTarget;
+      button.title = `确定要移除「${session.session_name}」的全部活动订阅吗？`;
+      armDangerButton(button, "确认移除？", () =>
+        post("session/remove", { umo: session.umo }, "已移除该会话的订阅"),
+      );
     });
 }
 
@@ -578,6 +602,7 @@ const templateState = {
   games: [],
   coverModes: ["image", "link", "off"],
   gameId: "",
+  urgentGames: 3,
   timer: null,
 };
 
@@ -687,6 +712,22 @@ function renderTemplateControls() {
     '  <span class="field-hint">选具体游戏会去拉真实活动；默认用内置示例，四档颜色都能看到。</span>',
     "</div>",
   ].join("");
+  const urgentOptions = [2, 3, 4, 5, 6]
+    .map(
+      (value) =>
+        '<option value="' + value + '"' +
+        (Number(templateState.urgentGames) === value ? " selected" : "") +
+        ">" + value + " 个游戏</option>",
+    )
+    .join("");
+  const urgentField = [
+    '<div class="field-group tmpl-game-field">',
+    '  <label class="field-label" for="tmpl-urgent-games">紧急提醒预览</label>',
+    '  <select id="tmpl-urgent-games">' + urgentOptions + "</select>",
+    '  <span class="field-hint">模拟这么多个游戏同时到期时，私聊提醒长什么样（示例数据，不拉真实活动）。</span>',
+    '  <button class="ghost-button" type="button" data-tmpl-jump="urgent">看右侧的紧急提醒预览 ↓</button>',
+    "</div>",
+  ].join("");
   const sections = TEMPLATE_FIELDS.map((section) =>
     [
       '<section class="tmpl-group">',
@@ -695,7 +736,7 @@ function renderTemplateControls() {
       "</section>",
     ].join(""),
   ).join("");
-  templateState.elements.controls.innerHTML = gameField + sections;
+  templateState.elements.controls.innerHTML = gameField + urgentField + sections;
   bindTemplateInputs();
 }
 
@@ -712,6 +753,17 @@ function bindTemplateInputs() {
   if (gameSelect) {
     gameSelect.addEventListener("change", () => {
       templateState.gameId = gameSelect.value;
+      refreshTemplatePreview();
+    });
+  }
+  const jumpButton = templateState.elements.controls.querySelector(
+    '[data-tmpl-jump="urgent"]',
+  );
+  if (jumpButton) jumpButton.addEventListener("click", scrollTemplateToUrgent);
+  const urgentSelect = document.getElementById("tmpl-urgent-games");
+  if (urgentSelect) {
+    urgentSelect.addEventListener("change", () => {
+      templateState.urgentGames = Number(urgentSelect.value) || 3;
       refreshTemplatePreview();
     });
   }
@@ -745,6 +797,7 @@ async function refreshTemplatePreview() {
     const preview = await bridge.apiPost("template-preview", {
       values: templateState.values,
       game_id: templateState.gameId || "",
+      urgent_games: templateState.urgentGames || 3,
     });
     templateState.preview = preview;
     renderTemplatePreview(preview);
@@ -830,6 +883,85 @@ function renderForwardBubble(preview) {
   return renderMessageFrame(preview, card);
 }
 
+function renderUrgentPreview(preview, urgent) {
+  if (!urgent || !urgent.nodes || !urgent.nodes.length) return "";
+  const sender = (preview && preview.sender) || {};
+  const lines = (urgent.plain_lines || [])
+    .map((line) => '<div class="qq-line">' + escapeHtml(line) + "</div>")
+    .join("");
+  const plain = renderMessageFrame(
+    preview,
+    '<div class="qq-bubble">' + lines + "</div>",
+  );
+  const forward = renderForwardBubble({
+    sender: sender,
+    forward: {
+      card_title: "群聊的聊天记录",
+      title_node: urgent.nodes[0],
+      nodes: urgent.nodes.slice(1),
+      footer: "查看" + urgent.nodes.length + "条转发消息",
+    },
+  });
+  return [
+    '<section class="tmpl-urgent">',
+    '  <div class="tmpl-urgent-head">',
+    '    <span class="tmpl-pane-title">紧急提醒 · 模拟 ' +
+      escapeHtml(String(urgent.count || 0)) +
+      " 个游戏同时到期</span>",
+    '    <span class="field-hint">示例数据，不拉真实活动；剩余时间刻意拉开四档，方便对比颜色。</span>',
+    "  </div>",
+    '  <div class="tmpl-urgent-panes">',
+    '    <div class="tmpl-pane">',
+    '      <div class="tmpl-pane-title">普通消息</div>',
+    plain,
+    "    </div>",
+    '    <div class="tmpl-pane">',
+    '      <div class="tmpl-pane-title">合并转发</div>',
+    forward,
+    "    </div>",
+    "  </div>",
+    "</section>",
+  ].join("");
+}
+
+function templateUrgentNode() {
+  return templateState.elements.preview.querySelector(".tmpl-urgent");
+}
+
+function scrollTemplateToUrgent() {
+  const target = templateUrgentNode();
+  if (!target) return;
+  const preview = templateState.elements.preview;
+  const top =
+    preview.scrollTop +
+    target.getBoundingClientRect().top -
+    preview.getBoundingClientRect().top -
+    8;
+  preview.scrollTo({ top: Math.max(0, top), behavior: "smooth" });
+}
+
+function updateTemplateScrollHint() {
+  const preview = templateState.elements.preview;
+  const hint = document.getElementById("tmpl-scroll-hint");
+  if (!hint) return;
+  const target = templateUrgentNode();
+  if (!target) {
+    hint.classList.add("is-hidden");
+    return;
+  }
+  const box = preview.getBoundingClientRect();
+  // 紧急提醒区顶边已经进入可见范围就撤掉引导；滚回上方或切游戏重渲染时自动回来
+  hint.classList.toggle("is-hidden", target.getBoundingClientRect().top < box.bottom - 48);
+}
+
+templateState.elements.preview.addEventListener("scroll", updateTemplateScrollHint, {
+  passive: true,
+});
+
+templateState.elements.preview.addEventListener("click", (event) => {
+  if (event.target.closest("#tmpl-scroll-hint")) scrollTemplateToUrgent();
+});
+
 function renderTemplatePreview(preview) {
   templateState.elements.preview.innerHTML = [
     '<div class="tmpl-pane">',
@@ -840,7 +972,13 @@ function renderTemplatePreview(preview) {
     '  <div class="tmpl-pane-title">合并转发</div>',
     renderForwardBubble(preview),
     "</div>",
+    renderUrgentPreview(preview, preview && preview.urgent),
+    '<button class="tmpl-scroll-hint" id="tmpl-scroll-hint" type="button">',
+    '  <span>下面还有「紧急提醒」预览，点我跳过去</span>',
+    '  <span aria-hidden="true">↓</span>',
+    "</button>",
   ].join("");
+  updateTemplateScrollHint();
 }
 
 function applyTemplateValues(values) {
@@ -1120,6 +1258,278 @@ settingsState.elements.reset.addEventListener("click", resetSettings);
 settingsState.elements.save.addEventListener("click", saveSettings);
 settingsState.elements.modal.addEventListener("click", (event) => {
   if (event.target === settingsState.elements.modal) closeSettings();
+});
+
+
+// ---- 紧急私聊提醒 ----
+
+const URGENT_FIELD_LABELS = {
+  trigger_days: "触发档位（剩余不足几天）",
+  repeat_minutes: "提醒间隔（分钟）",
+  daily_limit: "每天最多几次",
+};
+
+const URGENT_ACTIVITY_LIMIT = 5;
+
+const urgentState = {
+  data: null,
+  elements: {
+    button: document.getElementById("urgent-button"),
+    modal: document.getElementById("urgent-modal"),
+    close: document.getElementById("urgent-close"),
+    list: document.getElementById("urgent-list"),
+    note: document.getElementById("urgent-note"),
+    reload: document.getElementById("urgent-reload"),
+    newUmo: document.getElementById("urgent-new-umo"),
+    add: document.getElementById("urgent-add-button"),
+  },
+};
+
+function setUrgentNote(message = "", isError = false) {
+  urgentState.elements.note.textContent = message;
+  urgentState.elements.note.classList.toggle("is-error", isError);
+}
+
+function urgentOverrideValue(target, key) {
+  const current = (target.settings || {})[key];
+  // 空字符串表示「没有覆盖，跟随全局」
+  return current === undefined || current === null ? "" : String(current);
+}
+
+function renderUrgentCard(target) {
+  const data = urgentState.data || {};
+  const limits = data.limits || {};
+  const defaults = data.defaults || {};
+  const fields = Object.keys(URGENT_FIELD_LABELS)
+    .map((key) => {
+      const range = limits[key] || [];
+      const placeholder = "跟随全局 " + defaults[key];
+      const bound = range.length === 2
+        ? ' min="' + range[0] + '" max="' + range[1] + '"'
+        : "";
+      return [
+        '<div class="urgent-field">',
+        '  <label class="field-label">' + escapeHtml(URGENT_FIELD_LABELS[key]) + "</label>",
+        '  <input type="number" data-urgent-field="' + key + '" value="' +
+          escapeHtml(urgentOverrideValue(target, key)) + '" placeholder="' +
+          escapeHtml(placeholder) + '"' + bound + " />",
+        "</div>",
+      ].join("");
+    })
+    .join("");
+
+  const chosen = new Set(target.games || []);
+  const gameChips = (data.games || [])
+    .map((game) =>
+      [
+        '<label class="urgent-game">',
+        '  <input type="checkbox" data-urgent-game="' + escapeHtml(game.id) + '"' +
+          (chosen.has(game.id) ? " checked" : "") + " />",
+        "  <span>" + escapeHtml(game.name) + "</span>",
+        "</label>",
+      ].join(""),
+    )
+    .join("");
+
+  const items = target.activities || [];
+  const activityItem = (item) =>
+    [
+      '<li class="urgent-activity">',
+      '  <span class="urgent-activity-name">' +
+        escapeHtml(item.name || item.activity_id) + "</span>",
+      '  <span class="field-hint">' + escapeHtml(item.end || "") + "</span>",
+      item.acked
+        ? '  <span class="urgent-tag is-acked">已确认</span>'
+        : '  <span class="urgent-tag">已催 ' +
+          escapeHtml(String(item.sent_total || 0)) + " 次</span>",
+      "</li>",
+    ].join("");
+  const headActivities = items
+    .slice(0, URGENT_ACTIVITY_LIMIT)
+    .map(activityItem)
+    .join("");
+  const restItems = items.slice(URGENT_ACTIVITY_LIMIT);
+  const restActivities = restItems.map(activityItem).join("");
+
+  return [
+    '<article class="urgent-card" data-urgent-card="' + escapeHtml(target.umo) + '">',
+    '  <header class="urgent-card-head">',
+    '    <div class="urgent-card-title">',
+    "      <strong>" + escapeHtml(target.session_name) + "</strong>",
+    '      <span class="field-hint">' + escapeHtml(target.umo) + "</span>",
+    "    </div>",
+    '    <div class="urgent-card-actions">',
+    '      <label class="toggle tmpl-toggle urgent-switch">',
+    '        <input type="checkbox" data-urgent-enabled="1"' +
+          (target.enabled ? " checked" : "") + " />",
+    '        <span class="tmpl-toggle-text"><strong>启用</strong></span>',
+    "      </label>",
+    '      <button class="ghost-button" type="button" data-urgent-save="1">保存</button>',
+    '      <button class="ghost-button is-danger" type="button" data-urgent-remove="1">移除</button>',
+    "    </div>",
+    "  </header>",
+    '  <p class="urgent-effective">当前生效：' +
+      escapeHtml(target.describe || "") + "</p>",
+    '  <div class="urgent-fields">' + fields + "</div>",
+    '  <details class="urgent-games">',
+    "    <summary>限定游戏（都不勾 = 跟随全局与订阅）</summary>",
+    '    <div class="urgent-game-list">' + gameChips + "</div>",
+    "  </details>",
+    items.length
+      ? '  <ul class="urgent-activities">' + headActivities + "</ul>" +
+        (restItems.length
+          ? '  <details class="urgent-more"><summary>还有 ' +
+            escapeHtml(String(restItems.length)) +
+            ' 条记录，展开查看 ↓</summary><ul class="urgent-activities">' +
+            restActivities +
+            "</ul></details>"
+          : "")
+      : '  <p class="field-hint">还没有催过活动；一旦有活动进入档位，这里会列出进度。</p>',
+    "</article>",
+  ].join("");
+}
+
+function applyUrgent(data) {
+  urgentState.data = data || {};
+  const defaults = urgentState.data.defaults || {};
+  const targets = urgentState.data.targets || [];
+  const summary = [
+    '<p class="urgent-summary">',
+    "  全局默认 " + escapeHtml(String(defaults.trigger_days)) + " 天内开始，每 " +
+      escapeHtml(String(defaults.repeat_minutes)) + " 分钟最多一次，每天 " +
+      escapeHtml(String(defaults.daily_limit)) + " 次；目标共 " +
+      escapeHtml(String(targets.length)) + " 个。",
+    urgentState.data.enabled ? "" : "  <strong>全局开关是关闭的</strong>",
+    "</p>",
+  ].join("");
+  const cards = targets.map(renderUrgentCard).join("");
+  urgentState.elements.list.innerHTML =
+    summary +
+    (cards ||
+      '<p class="field-hint">还没有任何提醒目标。可以在群里用 /活动私人提醒 @某人 添加，或在上面的输入框里填 UMO。</p>');
+}
+
+function collectUrgentCard(card) {
+  const settings = {};
+  card.querySelectorAll("[data-urgent-field]").forEach((node) => {
+    const key = node.dataset.urgentField;
+    const raw = (node.value || "").trim();
+    settings[key] = raw === "" ? null : Number(raw);
+  });
+  const games = [];
+  card.querySelectorAll("[data-urgent-game]").forEach((node) => {
+    if (node.checked) games.push(node.dataset.urgentGame);
+  });
+  const enabledNode = card.querySelector("[data-urgent-enabled]");
+  return {
+    umo: card.dataset.urgentCard,
+    enabled: !!(enabledNode && enabledNode.checked),
+    settings: settings,
+    games: games,
+  };
+}
+
+async function loadUrgent() {
+  if (!bridge) return;
+  setUrgentNote("正在读取…");
+  try {
+    applyUrgent(await bridge.apiGet("urgent-targets"));
+    setUrgentNote("");
+  } catch (error) {
+    setUrgentNote(
+      error && error.message ? error.message : "读取紧急提醒配置失败",
+      true,
+    );
+  }
+}
+
+async function openUrgent() {
+  if (!bridge) {
+    bridgeMissing();
+    return;
+  }
+  urgentState.elements.modal.classList.remove("is-hidden");
+  await loadUrgent();
+}
+
+function closeUrgent() {
+  urgentState.elements.modal.classList.add("is-hidden");
+}
+
+async function submitUrgent(payload, successMessage) {
+  const data = await bridge.apiPost("urgent-save", payload);
+  applyUrgent(data);
+  setUrgentNote("");
+  showToast(successMessage);
+}
+
+async function saveUrgentCard(card, button) {
+  if (!bridge) return;
+  button.classList.add("is-loading");
+  try {
+    const payload = collectUrgentCard(card);
+    await submitUrgent(payload, "已保存 " + payload.umo);
+  } catch (error) {
+    setUrgentNote(error && error.message ? error.message : "保存失败", true);
+    showToast("保存失败", true);
+  } finally {
+    button.classList.remove("is-loading");
+  }
+}
+
+function armUrgentRemove(button, card) {
+  // 卡片里的「移除」同样不能依赖原生对话框，见 armDangerButton 的说明。
+  armDangerButton(button, "再点一次移除", () => removeUrgentCard(card));
+}
+
+async function removeUrgentCard(card) {
+  if (!bridge) return;
+  const umo = card.dataset.urgentCard;
+  try {
+    await submitUrgent({ umo: umo, remove: true }, "已移除 " + umo);
+  } catch (error) {
+    const message = error && error.message ? error.message : "移除失败";
+    setUrgentNote(message, true);
+    showToast("移除失败", true);
+  }
+}
+
+async function addUrgentTarget() {
+  if (!bridge) return;
+  const umo = (urgentState.elements.newUmo.value || "").trim();
+  if (!umo) {
+    setUrgentNote("先填一个目标，例如 aiocqhttp:FriendMessage:123456", true);
+    return;
+  }
+  urgentState.elements.add.classList.add("is-loading");
+  try {
+    await submitUrgent({ umo: umo, enabled: true, games: [] }, "已添加 " + umo);
+    urgentState.elements.newUmo.value = "";
+  } catch (error) {
+    setUrgentNote(error && error.message ? error.message : "添加失败", true);
+  } finally {
+    urgentState.elements.add.classList.remove("is-loading");
+  }
+}
+
+urgentState.elements.list.addEventListener("click", (event) => {
+  const card = event.target.closest("[data-urgent-card]");
+  if (!card) return;
+  const saveButton = event.target.closest("[data-urgent-save]");
+  if (saveButton) {
+    saveUrgentCard(card, saveButton);
+    return;
+  }
+  const removeButton = event.target.closest("[data-urgent-remove]");
+  if (removeButton) armUrgentRemove(removeButton, card);
+});
+
+urgentState.elements.button.addEventListener("click", openUrgent);
+urgentState.elements.close.addEventListener("click", closeUrgent);
+urgentState.elements.reload.addEventListener("click", loadUrgent);
+urgentState.elements.add.addEventListener("click", addUrgentTarget);
+urgentState.elements.modal.addEventListener("click", (event) => {
+  if (event.target === urgentState.elements.modal) closeUrgent();
 });
 
 elements.refreshButton.addEventListener("click", () =>

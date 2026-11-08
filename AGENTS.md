@@ -14,13 +14,15 @@ PRTS（明日方舟）的活动数据，按会话订阅推送到群聊 / 私聊�
 - `main.py`：配置读取、服务组装、插件生命周期、AstrBot 指令入口。
 - `activity_webui.py`：Plugin Pages 后端接口。
 - `sources/base.py`：活动模型、游戏定义、时间解析、带 ETag 与磁盘缓存的 HTTP 客户端、限速器。
-- `sources/sra.py`：SRA 公共 API（8 款游戏）。
+- `sources/sra.py`：SRA 公共 API（18 款游戏）。
 - `sources/akedata.py`：AKEData（终末地活动与寻访卡池）。
 - `sources/prts.py`：PRTS Semantic MediaWiki 查询（明日方舟）。
 - `sources/registry.py`：游戏注册表与用户输入解析。
 - `services/reminder_service.py`：提醒决策纯逻辑（档位、去重、关键词过滤）。
 - `services/subscription_service.py`：订阅与提醒状态的 KV 持久化。
 - `services/message_formatter.py`：推送文本格式化与封面默认值（纯字符串处理）。
+- `services/template_preview.py`：管理页「消息模板编辑器」的预览模型（纯逻辑）。
+- `services/urgent_dm_service.py`：紧急私聊提醒的节流与「已知晓」判定（纯逻辑）。
 - `services/cover_service.py`：封面下载、压缩与体积预算挑选。
 - `services/delivery_service.py`：消息发送（把片段转成 AstrBot 消息组件）。
 - `services/polling_service.py`：轮询编排（拉取 → 决策 → 投递 → 落盘）。
@@ -35,7 +37,8 @@ PRTS（明日方舟）的活动数据，按会话订阅推送到群聊 / 私聊�
 `astrbot` 只在 `main.py`、`activity_webui.py`、`services/cover_service.py`、
 `services/delivery_service.py` 与 `services/polling_service.py` 中出现。
 **新增逻辑时优先放进不依赖 astrbot 的模块**；纯逻辑模块（`reminder_service`、
-`subscription_service`、`message_formatter`、`sources/*`）不得引入 astrbot。
+`subscription_service`、`message_formatter`、`template_preview`、
+`urgent_dm_service`、`sources/*`）不得引入 astrbot。
 
 `services/__init__.py` 刻意不做统一再导出：一旦它导入了 `delivery_service`，
 所有 `services.*` 子模块的导入都会连带要求 astrbot 存在。
@@ -110,6 +113,10 @@ AstrBot 返回页面 HTML 时会做两件事（见 `astrbot/dashboard/services/p
 前端还应注意：module 作用域下的函数不会挂到 `window`，因此不能使用
 `onclick=` / `onload=` 这类内联事件处理器，必须用 `addEventListener`。
 
+模板编辑器的预览区是**滚动容器**，紧急提醒那一块在最下方。凡是往预览区底部追加内容，
+都要留一条显式的跳转引导（左栏按钮 + 预览区吸底提示条），因为用户不会主动去滑；
+引导要在目标进入视野后自动消失，并在重渲染时重新计算，不能只做一次。
+
 ## 消息构建与图片
 
 消息按**片段**（`MessagePart`）构建，而不是直接拼字符串：
@@ -172,8 +179,8 @@ AstrBot 的 `cmd_config.json` 里有一项 `plugin_set`（后台「配置 → �
 
 - 保持现有配置键、默认值与分组结构，除非任务明确要求破坏性调整。
 - 修改公开配置时同步更新 `_conf_schema.json` 与 README。
-- 保持 KV 键（`game_event_due_subscriptions_v1` / `game_event_due_notify_state_v1`）
-  与数据结构，除非提供迁移方案。
+- 保持 KV 键（`game_event_due_subscriptions_v1` / `game_event_due_notify_state_v1` /
+  `game_event_due_urgent_dm_v1`）与数据结构，除非提供迁移方案。
 - 缺少 Plugin Pages API 时插件主体仍应能加载（`activity_webui` 导入失败要降级）。
 
 ## 修改原则

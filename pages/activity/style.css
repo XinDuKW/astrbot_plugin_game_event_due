@@ -619,6 +619,30 @@ select:disabled {
   color: var(--text-muted);
 }
 
+/* 紧急提醒模拟：占满整行，内部再分左右两栏 */
+
+.tmpl-urgent {
+  grid-column: 1 / -1;
+  border-top: 1px dashed var(--border);
+  padding-top: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.tmpl-urgent-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.tmpl-urgent-panes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
 /* QQ 消息：头像和名字在气泡外，贴近手机端观感 */
 
 .qq-message {
@@ -780,5 +804,222 @@ select:disabled {
   .template-preview {
     grid-template-columns: 1fr;
     max-height: 46vh;
+  }
+}
+
+/* ---- 紧急私聊提醒管理 ---- */
+
+.ghost-button.is-danger {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.modal-body.is-urgent {
+  grid-template-columns: 1fr;
+  padding: 14px 18px 18px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.urgent-add {
+  display: flex;
+  gap: 8px;
+}
+
+.urgent-add input {
+  flex: 1;
+  min-width: 0;
+}
+
+.urgent-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.urgent-summary {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.urgent-summary strong {
+  color: var(--danger);
+}
+
+.urgent-card {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel-alt);
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.urgent-card-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.urgent-card-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.urgent-card-title strong {
+  font-size: 14px;
+}
+
+.urgent-card-title .field-hint {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.urgent-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.urgent-card-actions .toggle {
+  font-size: 12px;
+}
+
+.urgent-effective {
+  margin: 0;
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.urgent-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.urgent-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.urgent-games summary {
+  font-size: 12px;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.urgent-game-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  padding-top: 8px;
+}
+
+.urgent-game {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+
+.urgent-activities {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.urgent-activity {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.urgent-activity-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.urgent-tag {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+}
+
+.urgent-tag.is-acked {
+  background: rgba(47, 158, 99, 0.14);
+  color: var(--success);
+}
+
+/* 活动记录超过 5 条时折叠，剩下的收进 details */
+
+.urgent-more summary {
+  padding-top: 6px;
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+}
+
+.urgent-more .urgent-activities {
+  padding-top: 6px;
+}
+
+/* 移除按钮的「二次确认」态 */
+
+.ghost-button.is-armed {
+  border-color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  color: var(--danger);
+}
+
+/* 预览区底部「还有内容」引导：吸在滚动容器底部 */
+
+.tmpl-scroll-hint {
+  grid-column: 1 / -1;
+  position: sticky;
+  bottom: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 9px 14px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: var(--panel);
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+  box-shadow: var(--shadow);
+}
+
+.tmpl-scroll-hint:hover {
+  background: var(--accent-soft);
+}
+
+@media (max-width: 1000px) {
+  .urgent-fields {
+    grid-template-columns: 1fr;
   }
 }

@@ -9,6 +9,7 @@ from astrbot_plugin_game_event_due.services.urgent_dm_service import (
     DEFAULT_QUIET_HOURS,
     UrgentDmSettings,
     UrgentTargetState,
+    describe_target_settings,
     in_quiet_hours,
     is_ack_text,
     mark_acked,
@@ -18,7 +19,9 @@ from astrbot_plugin_game_event_due.services.urgent_dm_service import (
     normalize_games,
     normalize_targets,
     parse_quiet_hours,
+    parse_target_settings,
     should_notify_now,
+    target_settings,
     urgent_activities,
 )
 from astrbot_plugin_game_event_due.sources.base import Activity, GAME_TIMEZONE
@@ -313,3 +316,154 @@ def test_prune_urgent_dm_keeps_targets():
     assert removed == 1
     assert set(data["umo-1"]["activities"]) == {fresh.uid}
     assert "umo-1" in data
+
+
+# ---- 每个目标自己的节奏 ----
+
+
+def test_parse_target_settings_accepts_units():
+    assert parse_target_settings(["3天", "2小时", "3次"]) == {
+        "trigger_days": 3,
+        "repeat_minutes": 120,
+        "daily_limit": 3,
+    }
+    assert parse_target_settings(["7d"]) == {"trigger_days": 7}
+    assert parse_target_settings(["5日"]) == {"trigger_days": 5}
+    assert parse_target_settings(["90分钟"]) == {"repeat_minutes": 90}
+    assert parse_target_settings(["5h"]) == {"repeat_minutes": 300}
+    assert parse_target_settings(["2次"]) == {"daily_limit": 2}
+
+
+def test_parse_target_settings_treats_plain_number_as_days():
+    assert parse_target_settings(["3"]) == {"trigger_days": 3}
+
+
+def test_parse_target_settings_default_clears_overrides():
+    assert parse_target_settings(["默认"]) is None
+    assert parse_target_settings(["跟随", "3天"]) is None
+    assert parse_target_settings([]) == {}
+    assert parse_target_settings(["看不懂的东西"]) == {}
+
+
+def test_parse_target_settings_clamps_to_sane_range():
+    assert parse_target_settings(["0天"]) == {"trigger_days": 1}
+    assert parse_target_settings(["9999天"]) == {"trigger_days": 365}
+    assert parse_target_settings(["1分钟"]) == {"repeat_minutes": 5}
+    assert parse_target_settings(["0分钟"]) == {"repeat_minutes": 5}
+    assert parse_target_settings(["9999次"]) == {"daily_limit": 100}
+
+
+def test_target_settings_only_overrides_configured_keys():
+    base = settings(trigger_days=1, repeat_minutes=120, daily_limit=3)
+    merged = target_settings(base, {"settings": {"trigger_days": 7}})
+    assert merged.trigger_days == 7
+    assert merged.repeat_minutes == base.repeat_minutes
+    assert merged.daily_limit == base.daily_limit
+
+
+def test_target_settings_falls_back_to_global():
+    base = settings(trigger_days=3)
+    assert target_settings(base, None) is base
+    assert target_settings(base, {}) is base
+    assert target_settings(base, {"settings": {}}) is base
+    assert target_settings(base, {"settings": {"unknown": 1}}) is base
+
+
+def test_target_settings_ignores_garbage_values():
+    base = settings(trigger_days=1, daily_limit=3)
+    merged = target_settings(
+        base, {"settings": {"trigger_days": "5", "daily_limit": "很多"}}
+    )
+    assert merged.trigger_days == 5
+    assert merged.daily_limit == base.daily_limit
+
+
+def test_should_notify_now_follows_per_target_trigger_days():
+    activity = make_activity(end=timedelta(hours=60))
+    strict = settings(trigger_days=1, quiet_hours=None)
+    relaxed = settings(trigger_days=3, quiet_hours=None)
+    assert should_notify_now(activity, None, NOW, strict) is False
+    assert should_notify_now(activity, None, NOW, relaxed) is True
+
+
+def test_should_notify_now_follows_per_target_daily_limit():
+    activity = make_activity(end=timedelta(hours=6))
+    state = UrgentTargetState(
+        last_sent_at=(NOW - timedelta(hours=3)).isoformat(),
+        daily_date=NOW.date().isoformat(),
+        daily_count=1,
+    )
+    base = settings(repeat_minutes=60, daily_limit=3, quiet_hours=None)
+    capped = settings(repeat_minutes=60, daily_limit=1, quiet_hours=None)
+    assert should_notify_now(activity, state, NOW, base) is True
+    assert should_notify_now(activity, state, NOW, capped) is False
+
+
+def test_describe_target_settings_is_human_readable():
+    assert (
+        describe_target_settings(
+            settings(trigger_days=3, repeat_minutes=120, daily_limit=3)
+        )
+        == "3 天内 · 每 2 小时 · 每天最多 3 次"
+    )
+    assert (
+        describe_target_settings(
+            settings(trigger_days=1, repeat_minutes=90, daily_limit=0)
+        )
+        == "1 天内 · 每 90 分钟 · 不限次数"
+    )
+
+
+# ---- 每个目标设置的读写 ----
+
+
+def test_update_urgent_settings_merges_and_clears():
+    data: dict[str, dict] = {}
+    SubscriptionService.upsert_urgent_target(data, "umo-1", enabled=True)
+    SubscriptionService.update_urgent_settings(
+        data, "umo-1", {"trigger_days": 3, "repeat_minutes": 120}
+    )
+    assert data["umo-1"]["settings"] == {"trigger_days": 3, "repeat_minutes": 120}
+
+    SubscriptionService.update_urgent_settings(data, "umo-1", {"daily_limit": 2})
+    assert data["umo-1"]["settings"] == {
+        "trigger_days": 3,
+        "repeat_minutes": 120,
+        "daily_limit": 2,
+    }
+
+    SubscriptionService.update_urgent_settings(data, "umo-1", {"trigger_days": None})
+    assert data["umo-1"]["settings"] == {"repeat_minutes": 120, "daily_limit": 2}
+
+
+def test_update_urgent_settings_drops_key_when_empty():
+    data: dict[str, dict] = {}
+    SubscriptionService.upsert_urgent_target(
+        data, "umo-1", settings={"daily_limit": 1}
+    )
+    assert data["umo-1"]["settings"] == {"daily_limit": 1}
+    SubscriptionService.update_urgent_settings(data, "umo-1", {"daily_limit": None})
+    assert "settings" not in data["umo-1"]
+
+
+def test_update_urgent_settings_ignores_unknown_target_and_keys():
+    data: dict[str, dict] = {}
+    assert (
+        SubscriptionService.update_urgent_settings(data, "nobody", {"trigger_days": 3})
+        is None
+    )
+    SubscriptionService.upsert_urgent_target(data, "umo-1")
+    SubscriptionService.update_urgent_settings(
+        data, "umo-1", {"garbage": 1, "trigger_days": 0}
+    )
+    assert data["umo-1"]["settings"] == {"trigger_days": 1}
+
+
+def test_normalize_urgent_dm_keeps_target_settings():
+    raw = {
+        "targets": {
+            "umo-1": {"enabled": True, "settings": {"trigger_days": "7", "junk": 1}}
+        }
+    }
+    data = SubscriptionService._normalize_urgent_dm(raw)
+    assert data["umo-1"]["settings"] == {"trigger_days": 7}

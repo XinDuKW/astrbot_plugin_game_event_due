@@ -12,8 +12,9 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -288,3 +289,119 @@ def mark_acked(state: UrgentTargetState, now: datetime) -> UrgentTargetState:
     state.acked = True
     state.ack_at = now.isoformat()
     return state
+
+
+# ---- 每个目标自己的提醒节奏 ----
+
+SETTING_TRIGGER = "trigger_days"
+SETTING_REPEAT = "repeat_minutes"
+SETTING_LIMIT = "daily_limit"
+TARGET_SETTING_KEYS = (SETTING_TRIGGER, SETTING_REPEAT, SETTING_LIMIT)
+
+MIN_TRIGGER_DAYS = 1
+MAX_TRIGGER_DAYS = 365
+MIN_REPEAT_MINUTES = 5
+MAX_REPEAT_MINUTES = 1440
+MIN_DAILY_LIMIT = 0
+MAX_DAILY_LIMIT = 100
+
+DEFAULT_SETTING_TOKENS = ("默认", "跟随", "重置", "清除", "reset", "default")
+
+_DAYS_PATTERN = re.compile(r"^(\d+)\s*(?:天|日|d|day)$")
+_HOURS_PATTERN = re.compile(r"^(\d+)\s*(?:小时|时|h|hour)$")
+_MINUTES_PATTERN = re.compile(r"^(\d+)\s*(?:分钟|分|m|min)$")
+_TIMES_PATTERN = re.compile(r"^(\d+)\s*(?:次|条|回)$")
+_PLAIN_PATTERN = re.compile(r"^(\d+)$")
+
+
+def clamp_setting(key: str, value: Any) -> int | None:
+    """把一个覆盖值夹到合法区间；不认识的键或非数字返回 None。"""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return None
+    if key == SETTING_TRIGGER:
+        return min(MAX_TRIGGER_DAYS, max(MIN_TRIGGER_DAYS, number))
+    if key == SETTING_REPEAT:
+        return min(MAX_REPEAT_MINUTES, max(MIN_REPEAT_MINUTES, number))
+    if key == SETTING_LIMIT:
+        return min(MAX_DAILY_LIMIT, max(MIN_DAILY_LIMIT, number))
+    return None
+
+
+def parse_target_settings(tokens: Sequence[Any]) -> dict[str, int] | None:
+    """把命令参数解析成某个目标的提醒节奏。
+
+    支持的单位：3天 / 2小时 / 120分钟 / 3次；裸数字按「天数」处理。
+    返回 None 表示清空覆盖（恢复全局默认），返回空字典表示没有可识别的参数。
+    """
+    items = [str(token).strip() for token in tokens]
+    items = [item for item in items if item]
+    if not items:
+        return {}
+    if any(item.casefold() in DEFAULT_SETTING_TOKENS for item in items):
+        return None
+
+    parsed: dict[str, int] = {}
+    for item in items:
+        folded = item.casefold()
+        matched = _DAYS_PATTERN.match(folded)
+        if matched:
+            parsed[SETTING_TRIGGER] = clamp_setting(SETTING_TRIGGER, matched.group(1))
+            continue
+        matched = _HOURS_PATTERN.match(folded)
+        if matched:
+            minutes = int(matched.group(1)) * 60
+            parsed[SETTING_REPEAT] = clamp_setting(SETTING_REPEAT, minutes)
+            continue
+        matched = _MINUTES_PATTERN.match(folded)
+        if matched:
+            parsed[SETTING_REPEAT] = clamp_setting(
+                SETTING_REPEAT, matched.group(1)
+            )
+            continue
+        matched = _TIMES_PATTERN.match(folded)
+        if matched:
+            parsed[SETTING_LIMIT] = clamp_setting(SETTING_LIMIT, matched.group(1))
+            continue
+        matched = _PLAIN_PATTERN.match(folded)
+        if matched:
+            parsed[SETTING_TRIGGER] = clamp_setting(
+                SETTING_TRIGGER, matched.group(1)
+            )
+    return parsed
+
+
+def target_settings(
+    base: UrgentDmSettings,
+    entry: Mapping[str, Any] | None = None,
+) -> UrgentDmSettings:
+    """把某个目标自己配置的节奏合到全局设置上。
+
+    目标记录里的 settings 只认 trigger_days / repeat_minutes / daily_limit；
+    没写的项跟随全局，这样全局改默认值时不会把每个人的个性化设置冲掉。
+    """
+    overrides = entry.get("settings") if isinstance(entry, Mapping) else None
+    if not isinstance(overrides, Mapping):
+        return base
+    patch: dict[str, int] = {}
+    for key in TARGET_SETTING_KEYS:
+        number = clamp_setting(key, overrides.get(key))
+        if number is not None:
+            patch[key] = number
+    if not patch:
+        return base
+    return replace(base, **patch)
+
+
+def describe_target_settings(settings: UrgentDmSettings) -> str:
+    """人话描述一套节奏，用在命令回显里。"""
+    days = max(MIN_TRIGGER_DAYS, int(settings.trigger_days))
+    repeat = max(1, int(settings.repeat_minutes))
+    limit = max(0, int(settings.daily_limit))
+    if repeat >= 60 and repeat % 60 == 0:
+        interval = f"{repeat // 60} 小时"
+    else:
+        interval = f"{repeat} 分钟"
+    quota = f"每天最多 {limit} 次" if limit else "不限次数"
+    return f"{days} 天内 · 每 {interval} · {quota}"

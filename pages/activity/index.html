@@ -23,6 +23,9 @@
           <button class="ghost-button" id="template-button" type="button">
             消息模板
           </button>
+          <button class="ghost-button" id="urgent-button" type="button">
+            紧急提醒
+          </button>
           <button class="ghost-button" id="cycle-button" type="button">
             立即检查
           </button>
@@ -161,6 +164,56 @@
             </button>
             <button class="primary-button" id="settings-save" type="button">
               保存设置
+            </button>
+          </div>
+        </footer>
+      </div>
+    </div>
+
+    <div
+      class="modal is-hidden"
+      id="urgent-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-label="紧急私聊提醒管理"
+    >
+      <div class="modal-panel">
+        <header class="modal-head">
+          <div>
+            <h2>紧急私聊提醒</h2>
+            <p class="modal-sub">
+              每个目标可以单独设触发档位、提醒间隔与每日上限；留空表示跟随全局默认。
+            </p>
+          </div>
+          <button
+            class="icon-button"
+            id="urgent-close"
+            type="button"
+            title="关闭"
+            aria-label="关闭"
+          >
+            ×
+          </button>
+        </header>
+        <div class="modal-body is-urgent">
+          <div class="urgent-add">
+            <input
+              id="urgent-new-umo"
+              type="text"
+              placeholder="要提醒谁：aiocqhttp:FriendMessage:123456"
+              aria-label="新的提醒目标"
+            />
+            <button class="ghost-button" id="urgent-add-button" type="button">
+              添加目标
+            </button>
+          </div>
+          <div class="urgent-list" id="urgent-list"></div>
+        </div>
+        <footer class="modal-foot">
+          <span class="field-hint" id="urgent-note"></span>
+          <div class="detail-actions">
+            <button class="ghost-button" id="urgent-reload" type="button">
+              重新读取
             </button>
           </div>
         </footer>
