@@ -96,13 +96,15 @@ USAGE_URGENT_DM = (
     "/活动私人提醒 设置 3天 2小时 3次         在私聊里直接设置自己的\n"
     "/活动私人提醒 移除 @某人  把某人移出紧急提醒（管理员）\n"
     "/活动私人提醒 列表        查看提醒目标与各自的节奏\n"
-    "/活动私人提醒 停止        停止对自己的紧急提醒\n"
+    "/活动私人提醒 停止        暂停对自己的紧急提醒（设置与记录保留）\n"
+    "/活动私人提醒 开启        重新开启暂停的紧急提醒\n"
     "/活动私人提醒 测试        给自己发一条测试私聊\n"
     "设置的单位：3天=剩余不足 3 天就开始催，2小时=每 2 小时催一次，"
     "3次=每天最多 3 次；\n"
     "填「默认」恢复跟随全局配置。也可以直接贴 aiocqhttp:FriendMessage:123456 "
     "这种会话号指定目标。\n"
-    "被提醒的人回一句 /我已知晓 即可停止提醒；跟上活动名可以只停那一个。"
+    "被提醒的人回一句 /我已知晓 就停掉最近那一轮提醒；跟上活动名只停那一个，\n"
+    "写「全部」则一次停掉所有活动。"
 )
 USAGE_FILTER = (
     "用法:\n"
@@ -111,6 +113,7 @@ USAGE_FILTER = (
     "/活动过滤 清空                清空全部关键词"
 )
 
+ACK_ALL_TOKENS = {"全部", "所有", "全选", "all", "全部活动"}
 BLACKLIST_TOKENS = {"黑名单", "blacklist", "black"}
 WHITELIST_TOKENS = {"白名单", "whitelist", "white"}
 RESET_TOKENS = {"默认", "default", "重置", "reset"}
@@ -1015,13 +1018,12 @@ class GameActivityPlugin(Star):
 
     @filter.command("活动私人提醒", alias={"game_dm", "活动私聊提醒"})
     async def urgent_dm_command(self, event: AstrMessageEvent):
-        """管理紧急私聊提醒目标: /活动私人提醒 @某人 | 移除 @某人 | 列表 | 停止 | 测试。"""
+        """管理紧急私聊提醒目标: /活动私人提醒 @某人 | 移除 @某人 | 列表 | 停止 | 开启 | 测试。"""
         umo = event.unified_msg_origin
         self_umo = self._self_private_umo(event)
         tokens = self._args(event)
         action = tokens[0].lower() if tokens else "列表"
         is_admin = self._event_is_admin(event)
-        now = datetime.now(GAME_TIMEZONE)
 
         if action in ("列表", "list", "查看"):
             data = await self.subscriptions.get_urgent_dm()
@@ -1050,17 +1052,30 @@ class GameActivityPlugin(Star):
             yield event.plain_result("紧急私聊提醒目标:\n" + "\n".join(lines))
             return
 
-        if action in ("停止", "退订", "stop"):
+        if action in ("停止", "暂停", "退订", "stop", "pause"):
+            # 「停止」只暂停，保留节奏设置与活动记录；真要删掉用「移除」
             data = await self.subscriptions.get_urgent_dm()
-            acked = SubscriptionService.ack_urgent_activities(
-                data, self_umo, now, ()
-            )
-            removed = SubscriptionService.remove_urgent_target(data, self_umo)
-            if acked or removed:
-                await self.subscriptions.save_urgent_dm(data)
-                yield event.plain_result("✅ 已停止对你的紧急私聊提醒。")
+            if not isinstance(data.get(self_umo), dict):
+                yield event.plain_result("当前没有对你生效的紧急提醒。")
                 return
-            yield event.plain_result("当前没有对你生效的紧急提醒。")
+            SubscriptionService.upsert_urgent_target(data, self_umo, enabled=False)
+            await self.subscriptions.save_urgent_dm(data)
+            yield event.plain_result(
+                "✅ 已暂停对你的紧急私聊提醒，节奏设置与活动记录都保留着。\n"
+                "想重新开启：/活动私人提醒 开启；要彻底删掉：/活动私人提醒 移除"
+            )
+            return
+
+        if action in ("开启", "恢复", "start", "resume"):
+            data = await self.subscriptions.get_urgent_dm()
+            if not isinstance(data.get(self_umo), dict):
+                yield event.plain_result(
+                    "你还不在紧急私聊提醒名单里。\n发送 /活动私人提醒 即可加入。"
+                )
+                return
+            SubscriptionService.upsert_urgent_target(data, self_umo, enabled=True)
+            await self.subscriptions.save_urgent_dm(data)
+            yield event.plain_result("✅ 已重新开启对你的紧急私聊提醒。")
             return
 
         if action in ("测试", "test"):
@@ -1156,13 +1171,13 @@ class GameActivityPlugin(Star):
 
     @filter.command("我已知晓", alias={"活动已知晓", "game_ack", "已知晓"})
     async def ack_urgent_dm(self, event: AstrMessageEvent):
-        """确认已知晓: /我已知晓 [活动名关键词]，停止对自己的紧急提醒。"""
+        """确认已知晓: /我已知晓 [活动名关键词|全部]，停止对自己的紧急提醒。"""
         tokens = self._args(event)
-        acked = await self._ack_now(self._self_private_umo(event), tokens)
+        acked, ack_all = await self._ack_now(self._self_private_umo(event), tokens)
         if not acked:
-            yield event.plain_result("当前没有对你生效的紧急提醒。")
+            yield event.plain_result(self._ack_no_match_reply(tokens))
             return
-        yield event.plain_result(self._ack_reply(acked))
+        yield event.plain_result(self._ack_reply(acked, ack_all=ack_all))
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def ack_by_keyword(self, event: AstrMessageEvent):
@@ -1173,36 +1188,65 @@ class GameActivityPlugin(Star):
         if not text or not is_ack_text(text, self.urgent_dm.ack_keywords):
             return
 
-        acked = await self._ack_now(
+        acked, ack_all = await self._ack_now(
             self._self_private_umo(event), self._ack_scope(text)
         )
         if not acked:
             return
         event.stop_event()
-        yield event.plain_result(self._ack_reply(acked))
+        yield event.plain_result(self._ack_reply(acked, ack_all=ack_all))
 
-    async def _ack_now(self, umo: str, scope: Sequence[str]) -> list[str]:
-        """确认知晓并落盘。
+    async def _ack_now(
+        self, umo: str, scope: Sequence[str]
+    ) -> tuple[list[str], bool]:
+        """确认知晓并落盘，返回 (被确认的活动名, 是否全量确认)。
 
-        scope 为空表示全部确认；填了活动名关键词时优先只停命中的那些，一个都
-        没命中时退化成全部确认——用户写「我已知晓 xx」时不该被卡住。
+        不带任何活动名时只确认「最近一轮被催的那批活动」——用户回一句「我已知晓」
+        想停的是刚看到的那条提醒，不该把历史上催过的所有活动一起停掉。要全量确认
+        得显式写「我已知晓 全部」；写了活动名但一个都没命中时不做任何确认。
         """
         data = await self.subscriptions.get_urgent_dm()
         if not data.get(umo):
-            return []
+            return ([], False)
         now = datetime.now(GAME_TIMEZONE)
-        acked = SubscriptionService.ack_urgent_activities(data, umo, now, scope)
-        if not acked and scope:
+
+        lowered = [token.casefold() for token in scope]
+        ack_all = any(token in ACK_ALL_TOKENS for token in lowered)
+        if ack_all:
             acked = SubscriptionService.ack_urgent_activities(data, umo, now, ())
+        else:
+            filters = tuple(
+                token for token in scope
+                if token.casefold() not in ACK_ALL_TOKENS
+            )
+            acked = (
+                SubscriptionService.ack_urgent_activities(data, umo, now, filters)
+                if filters
+                else SubscriptionService.ack_latest_batch(data, umo, now)
+            )
         if acked:
             await self.subscriptions.save_urgent_dm(data)
-        return acked
+        return (acked, ack_all)
 
     @staticmethod
-    def _ack_reply(acked: Sequence[str]) -> str:
+    def _ack_reply(acked: Sequence[str], *, ack_all: bool = False) -> str:
         names = "、".join(acked[:6])
         extra = "" if len(acked) <= 6 else f" 等 {len(acked)} 个活动"
-        return f"✅ 已记下「已知晓」，这些活动不会再提醒你：{names}{extra}"
+        if ack_all:
+            return f"✅ 已记下「已知晓」，全部这些活动都不再提醒：{names}{extra}"
+        return (
+            f"✅ 已记下「已知晓」，本轮这些活动不会再催你：{names}{extra}\n"
+            "（要一次停掉所有活动：/我已知晓 全部；彻底关掉私人提醒：/活动私人提醒 停止）"
+        )
+
+    @staticmethod
+    def _ack_no_match_reply(scope: Sequence[str]) -> str:
+        if not scope:
+            return "当前没有对你生效的紧急提醒。"
+        return (
+            f"没找到名字里有「{'、'.join(scope)}」的待确认活动。\n"
+            "不带活动名回 /我已知晓 可以停掉最近那一轮提醒。"
+        )
 
     def _ack_scope(self, text: str) -> tuple[str, ...]:
         """从确认语句里剥掉关键词，剩下的当作活动名过滤条件。"""

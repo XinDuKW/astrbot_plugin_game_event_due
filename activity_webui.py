@@ -459,11 +459,11 @@ class ActivityWebUIController:
             message_type, session_id = (parsed[1], parsed[2]) if parsed else ("", umo)
             effective = target_settings(base, entry)
             activities = [
-                state
-                for state in (entry.get("activities") or {}).values()
+                (uid, state)
+                for uid, state in (entry.get("activities") or {}).items()
                 if isinstance(state, dict)
             ]
-            activities.sort(key=lambda item: str(item.get("end") or ""))
+            activities.sort(key=lambda item: str(item[1].get("end") or ""))
             rows.append(
                 {
                     "umo": umo,
@@ -481,14 +481,15 @@ class ActivityWebUIController:
                     "describe": describe_target_settings(effective),
                     "activities": [
                         {
-                            "activity_id": str(state.get("activity_id") or ""),
+                            "uid": str(uid),
+                            "activity_id": str(uid),
                             "name": str(state.get("name") or ""),
                             "end": str(state.get("end") or ""),
                             "acked": bool(state.get("acked")),
                             "sent_total": int(state.get("sent_total") or 0),
                             "last_sent_at": str(state.get("last_sent_at") or ""),
                         }
-                        for state in activities
+                        for uid, state in activities
                     ],
                 }
             )

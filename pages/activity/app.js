@@ -1332,14 +1332,17 @@ function renderUrgentCard(target) {
     .join("");
 
   const items = target.activities || [];
+  const ackedCount = items.filter((item) => item.acked).length;
   const activityItem = (item) =>
     [
       '<li class="urgent-activity">',
       '  <span class="urgent-activity-name">' +
-        escapeHtml(item.name || item.activity_id) + "</span>",
+        escapeHtml(item.name || item.uid || "") + "</span>",
       '  <span class="field-hint">' + escapeHtml(item.end || "") + "</span>",
       item.acked
-        ? '  <span class="urgent-tag is-acked">已确认</span>'
+        ? '  <span class="urgent-tag is-acked">已确认</span>' +
+          '  <button class="ghost-button urgent-ack-clear" type="button" data-urgent-ack="' +
+          escapeHtml(item.uid || "") + '">解除</button>'
         : '  <span class="urgent-tag">已催 ' +
           escapeHtml(String(item.sent_total || 0)) + " 次</span>",
       "</li>",
@@ -1364,6 +1367,10 @@ function renderUrgentCard(target) {
           (target.enabled ? " checked" : "") + " />",
     '        <span class="tmpl-toggle-text"><strong>启用</strong></span>',
     "      </label>",
+      ackedCount
+        ? '      <button class="ghost-button" type="button" data-urgent-ack-clear="1">解除确认（' +
+          escapeHtml(String(ackedCount)) + "）</button>"
+        : "",
     '      <button class="ghost-button" type="button" data-urgent-save="1">保存</button>',
     '      <button class="ghost-button is-danger" type="button" data-urgent-remove="1">移除</button>',
     "    </div>",
@@ -1494,6 +1501,22 @@ async function removeUrgentCard(card) {
   }
 }
 
+async function clearUrgentAck(card, uid, button) {
+  if (!bridge) return;
+  button.classList.add("is-loading");
+  try {
+    await submitUrgent(
+      { umo: card.dataset.urgentCard, reset_ack: true, activity_id: uid },
+      uid ? "已解除这个活动的确认" : "已解除全部确认",
+    );
+  } catch (error) {
+    setUrgentNote(error && error.message ? error.message : "解除确认失败", true);
+    showToast("解除确认失败", true);
+  } finally {
+    button.classList.remove("is-loading");
+  }
+}
+
 async function addUrgentTarget() {
   if (!bridge) return;
   const umo = (urgentState.elements.newUmo.value || "").trim();
@@ -1518,6 +1541,16 @@ urgentState.elements.list.addEventListener("click", (event) => {
   const saveButton = event.target.closest("[data-urgent-save]");
   if (saveButton) {
     saveUrgentCard(card, saveButton);
+    return;
+  }
+  const ackButton = event.target.closest("[data-urgent-ack]");
+  if (ackButton) {
+    clearUrgentAck(card, ackButton.dataset.urgentAck || "", ackButton);
+    return;
+  }
+  const ackAllButton = event.target.closest("[data-urgent-ack-clear]");
+  if (ackAllButton) {
+    clearUrgentAck(card, "", ackAllButton);
     return;
   }
   const removeButton = event.target.closest("[data-urgent-remove]");

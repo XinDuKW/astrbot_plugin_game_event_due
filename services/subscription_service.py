@@ -630,6 +630,52 @@ class SubscriptionService:
         return acked
 
     @staticmethod
+    def ack_latest_batch(
+        data: dict[str, dict[str, Any]],
+        umo: str,
+        now: datetime,
+    ) -> list[str]:
+        """只确认「最近一轮被催的那批」活动，返回被确认的活动名。
+
+        不加活动名只说一句「我已知晓」时，用户想停的是刚看到的那条提醒，而不是
+        历史上被催过的所有活动。同一轮里被催的多个活动共用同一个 ``last_sent_at``，
+        所以按它的最大值取一批；从未被催过的条目不在这批里。
+        """
+        entry = data.get(umo)
+        bucket = entry.get("activities") if isinstance(entry, dict) else None
+        if not isinstance(bucket, dict):
+            return []
+
+        latest = ""
+        for raw in bucket.values():
+            if not isinstance(raw, dict):
+                continue
+            state = UrgentTargetState.from_dict(raw)
+            if state.acked or not state.last_sent_at:
+                continue
+            if state.last_sent_at > latest:
+                latest = state.last_sent_at
+        if not latest:
+            return []
+
+        acked: list[str] = []
+        for uid, raw in list(bucket.items()):
+            if not isinstance(raw, dict):
+                continue
+            state = UrgentTargetState.from_dict(raw)
+            if state.acked or state.last_sent_at != latest:
+                continue
+            mark_acked(state, now)
+            payload = state.to_dict()
+            payload["name"] = str(raw.get("name") or "")
+            end_value = raw.get("end")
+            if isinstance(end_value, str) and end_value:
+                payload["end"] = end_value
+            bucket[uid] = payload
+            acked.append(payload["name"] or uid)
+        return acked
+
+    @staticmethod
     def prune_urgent_dm(
         data: dict[str, dict[str, Any]],
         now: datetime,

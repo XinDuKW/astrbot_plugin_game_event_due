@@ -985,6 +985,15 @@ select:disabled {
   padding-top: 6px;
 }
 
+/* 已确认活动行尾的「解除」按钮：贴着那一行，别撑高列表 */
+
+.urgent-ack-clear {
+  flex: none;
+  padding: 1px 8px;
+  font-size: 11px;
+  line-height: 1.6;
+}
+
 /* 移除按钮的「二次确认」态 */
 
 .ghost-button.is-armed {

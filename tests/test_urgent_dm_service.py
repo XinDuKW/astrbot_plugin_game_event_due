@@ -244,6 +244,24 @@ def test_upsert_and_remove_urgent_target():
     assert SubscriptionService.remove_urgent_target(data, "umo-1") is False
 
 
+def test_pausing_target_keeps_settings_and_activity_records():
+    """「停止」只置 enabled=False，节奏设置与活动记录都要留着。"""
+    data: dict[str, dict] = {}
+    activity = make_activity("方寸大冒险")
+    SubscriptionService.upsert_urgent_target(data, "umo-1")
+    SubscriptionService.record_urgent_state(
+        data, "umo-1", activity, mark_sent(UrgentTargetState(), NOW)
+    )
+    SubscriptionService.update_urgent_settings(data, "umo-1", {"trigger_days": 5})
+
+    SubscriptionService.upsert_urgent_target(data, "umo-1", enabled=False)
+
+    entry = data["umo-1"]
+    assert entry["enabled"] is False
+    assert entry["settings"]["trigger_days"] == 5
+    assert activity.uid in entry["activities"]
+
+
 def test_record_and_ack_urgent_state():
     activity = make_activity("方寸大冒险")
     data: dict[str, dict] = {}
@@ -274,6 +292,53 @@ def test_ack_can_target_a_single_activity():
     bucket = data["umo-1"]["activities"]
     assert bucket[first.uid]["acked"] is True
     assert not bucket[second.uid].get("acked")
+
+
+def test_ack_without_name_only_stops_the_latest_round():
+    """一句「我已知晓」只停最近一轮被催的活动，历史条目保持原样。"""
+    data: dict[str, dict] = {}
+    earlier = make_activity("老活动", activity_id="a", end=timedelta(hours=40))
+    latest = make_activity("本轮活动", activity_id="b", end=timedelta(hours=6))
+    SubscriptionService.record_urgent_state(
+        data,
+        "umo-1",
+        earlier,
+        mark_sent(UrgentTargetState(), NOW - timedelta(days=1)),
+    )
+    SubscriptionService.record_urgent_state(
+        data, "umo-1", latest, mark_sent(UrgentTargetState(), NOW)
+    )
+
+    acked = SubscriptionService.ack_latest_batch(data, "umo-1", NOW)
+    assert acked == ["本轮活动"]
+    bucket = data["umo-1"]["activities"]
+    assert bucket[latest.uid]["acked"] is True
+    assert not bucket[earlier.uid].get("acked")
+
+
+def test_ack_without_name_stops_every_activity_of_the_same_round():
+    data: dict[str, dict] = {}
+    first = make_activity("甲活动", activity_id="a", end=timedelta(hours=6))
+    second = make_activity("乙活动", activity_id="b", end=timedelta(hours=8))
+    for activity in (first, second):
+        SubscriptionService.record_urgent_state(
+            data, "umo-1", activity, mark_sent(UrgentTargetState(), NOW)
+        )
+
+    acked = SubscriptionService.ack_latest_batch(data, "umo-1", NOW)
+    assert sorted(acked) == sorted(["甲活动", "乙活动"])
+    assert SubscriptionService.ack_latest_batch(data, "umo-1", NOW) == []
+
+
+def test_ack_without_name_ignores_never_sent_entries():
+    data: dict[str, dict] = {}
+    fresh = make_activity("还没催过", activity_id="c", end=timedelta(hours=5))
+    SubscriptionService.record_urgent_state(
+        data, "umo-1", fresh, UrgentTargetState()
+    )
+
+    assert SubscriptionService.ack_latest_batch(data, "umo-1", NOW) == []
+    assert not data["umo-1"]["activities"][fresh.uid].get("acked")
 
 
 def test_normalize_urgent_dm_drops_garbage():

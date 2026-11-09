@@ -155,6 +155,8 @@ def test_urgent_overview_lists_defaults_limits_and_games():
     activities = payload["targets"][0]["activities"]
     assert [item["name"] for item in activities] == ["虚妄的星穹", "无音消除"]
     assert activities[1]["acked"] is True
+    # 前端「解除」按钮要用 uid 定位单条，接口里必须带上
+    assert [item["uid"] for item in activities] == ["sr:1", "ww:1"]
 
 
 def test_urgent_overview_describes_effective_pacing():
@@ -285,6 +287,21 @@ def test_urgent_save_resets_acknowledged_activity(monkeypatch):
 
     activities = payload["targets"][0]["activities"]
     assert [item["acked"] for item in activities] == [False, False]
+
+
+def test_urgent_save_reset_ack_can_target_a_single_activity(monkeypatch):
+    entry = _target_entry()
+    entry["activities"]["sr:1"]["acked"] = True
+    controller, _ = make_controller(data={FRIEND: entry})
+    _patch_payload(
+        monkeypatch,
+        {"umo": FRIEND, "reset_ack": True, "activity_id": "ww:1"},
+    )
+
+    payload = asyncio.run(controller.urgent_save())
+
+    by_uid = {item["uid"]: item["acked"] for item in payload["targets"][0]["activities"]}
+    assert by_uid == {"sr:1": True, "ww:1": False}
 
 
 def test_urgent_save_reset_ack_reports_nothing_to_clear(monkeypatch):
