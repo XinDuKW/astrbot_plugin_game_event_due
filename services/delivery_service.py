@@ -39,6 +39,11 @@ from .reminder_service import ReminderPlan
 
 NODE_NAME = "游戏活动日历"
 
+# 只有 aiocqhttp 系（NapCat / Lagrange 等）会真正渲染合并转发。
+# QQ 官方机器人适配器会忽略 Node/Nodes 组件，整条消息变空后被直接丢弃，
+# 所以必须按平台判断，不能靠发送异常兜底。
+FORWARD_PLATFORMS = frozenset({"aiocqhttp"})
+
 SEND_TEXT = "text"
 SEND_IMAGE = "image"
 
@@ -69,6 +74,18 @@ class ActivityDeliveryService:
         self.context = context
         self.settings = settings
         self.resolver = resolver
+
+    # ---- 平台能力 ----
+
+    @staticmethod
+    def supports_forward(umo: str) -> bool:
+        """当前会话所在平台是否支持合并转发。
+
+        QQ 官方机器人（qq_official）会忽略 Node/Nodes 且不抛异常，直接丢掉整条
+        消息，所以这里必须先看平台；其它平台一律走普通消息。
+        """
+        prefix = umo.split(":", 1)[0].strip().casefold() if umo else ""
+        return prefix in FORWARD_PLATFORMS
 
     # ---- 片段 → 发送项 ----
 
@@ -266,6 +283,8 @@ class ActivityDeliveryService:
         """
         if not groups:
             return True
+        if not self.supports_forward(umo):
+            return False
         node_name = node_name or settings.forward_node_name or NODE_NAME
         head, _, summary = title.partition("\n")
         tail = f"{summary}\n\n{ack_hint}" if ack_hint else summary
@@ -298,11 +317,15 @@ class ActivityDeliveryService:
         settings: MessageSettings,
         *,
         source_name: str = "",
+        umo: str = "",
     ) -> list[Any] | None:
         """「当前活动一览」的转发链：标题节点 + 每个活动一个节点。
 
-        节点名统一用游戏简称，点开后逐条都是完整活动（含封面）。
+        节点名统一用游戏简称，点开后逐条都是完整活动（含封面）。平台不支持
+        合并转发时返回 None，由调用方回退普通消息。
         """
+        if not self.supports_forward(umo):
+            return None
         header, blocks = build_overview_blocks(
             game, activities, now, settings, source_name=source_name
         )
@@ -323,6 +346,7 @@ class ActivityDeliveryService:
         *,
         node_name: str = NODE_NAME,
         forward_title: str = "",
+        umo: str = "",
     ) -> list[Any]:
         """供指令回复使用：解析封面后返回可直接 yield 的消息链。
 
@@ -331,7 +355,7 @@ class ActivityDeliveryService:
         """
         effective = settings or self.settings
         chain = self.build_chain(await self.resolve_parts(parts, effective))
-        if effective.use_forward_node:
+        if effective.use_forward_node and self.supports_forward(umo):
             nodes = [self._plain_chain(forward_title), chain]
             forward = self.build_forward_chain(nodes, node_name)
             if forward is not None:
@@ -378,6 +402,8 @@ class ActivityDeliveryService:
         一个游戏只发一条转发消息，游戏内的每个活动各自成为一个节点。返回
         False 表示当前环境不支持或发送失败，调用方应回退为普通消息。
         """
+        if not self.supports_forward(umo):
+            return False
         chain = self.build_forward_chain(node_chains, node_name)
         if chain is None:
             return False
@@ -402,7 +428,7 @@ class ActivityDeliveryService:
 
         effective = settings or self.settings
         # 与提醒推送共用同一套转发实现：支持就转发，不支持或失败就回退普通消息
-        if effective.use_forward_node:
+        if effective.use_forward_node and self.supports_forward(umo):
             nodes = [self._plain_chain(forward_title), chain]
             if await self._send_as_forward_nodes(umo, nodes, node_name):
                 return True
@@ -485,7 +511,7 @@ class ActivityDeliveryService:
 
         # 合并转发：一个游戏一条转发消息，游戏内的每个活动各自成为一个节点。
         # 多个游戏之间不合并——每个游戏仍然是自己的一条转发消息。
-        if effective.use_forward_node:
+        if effective.use_forward_node and self.supports_forward(umo):
             ordered = self._ordered_plans(plans, now, effective)
             chains = await self._build_forward_nodes(ordered, now, effective)
             node_name = short_game_name(game, effective)

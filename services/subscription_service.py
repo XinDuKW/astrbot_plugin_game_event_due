@@ -82,6 +82,19 @@ def _optional_cover_mode(value: Any) -> str | None:
     return text if text in COVER_MODES else None
 
 
+def _merge_unique(*groups: Any) -> list[str]:
+    """按出现顺序合并多个字符串序列并去重，空值丢弃。"""
+    seen: set[str] = set()
+    merged: list[str] = []
+    for group in groups:
+        for item in group or []:
+            key = str(item or "").strip()
+            if key and key not in seen:
+                seen.add(key)
+                merged.append(key)
+    return merged
+
+
 def normalize_session(raw: Any) -> dict[str, Any]:
     """把任意来源的会话记录规范化为内部结构。"""
     if not isinstance(raw, dict):
@@ -265,6 +278,208 @@ class SubscriptionService:
             sessions.pop(umo, None)
             await self._put_kv(SUBSCRIPTIONS_KEY, {"sessions": sessions})
             return True
+
+    async def migrate_session(
+        self,
+        old_umo: str,
+        new_umo: str,
+        *,
+        merge: bool = True,
+    ) -> dict[str, Any]:
+        """把一个会话的全部数据搬到新的会话号（UMO）。
+
+        换群、换机器人账号之后，旧会话号再也匹配不到任何消息，订阅、提醒进度
+        和紧急私聊目标就都「看起来丢了」。这里把三份 KV 一起搬走：
+
+        * ``game_event_due_subscriptions_v1``：订阅设置
+        * ``game_event_due_notify_state_v1``：哪些提醒已经推送过
+        * ``game_event_due_urgent_dm_v1``：紧急私聊目标与催办进度
+
+        提醒进度必须一起搬，否则换群之后还没结束的活动会被重新推一遍。
+
+        ``merge=True`` 时与目标会话已有的数据合并，档位、开关、封面这类冲突项
+        以**目标会话**为准（它才是用户现在正在用的那个）；``merge=False`` 时
+        旧数据直接覆盖目标。
+        """
+        old_key = str(old_umo or "").strip()
+        new_key = str(new_umo or "").strip()
+        if not old_key or not new_key:
+            raise ValueError("会话号不能为空")
+        if old_key == new_key:
+            raise ValueError("新旧会话号不能相同")
+
+        async with self._lock:
+            sessions = self._normalize_all(
+                await self._get_kv(SUBSCRIPTIONS_KEY, {})
+            )
+            notify_state = self._normalize_notify_state(
+                await self._get_kv(NOTIFY_STATE_KEY, {})
+            )
+            urgent = self._normalize_urgent_dm(
+                await self._get_kv(URGENT_DM_KEY, {})
+            )
+
+            source_session = sessions.get(old_key)
+            source_notify = notify_state.get(old_key)
+            source_urgent = urgent.get(old_key)
+            if (
+                source_session is None
+                and not source_notify
+                and source_urgent is None
+            ):
+                return {
+                    "moved": False,
+                    "merged": False,
+                    "session": False,
+                    "urgent": False,
+                    "notify_entries": 0,
+                }
+
+            target_session = sessions.get(new_key)
+            target_notify = notify_state.get(new_key)
+            target_urgent = urgent.get(new_key)
+
+            sessions.pop(old_key, None)
+            notify_state.pop(old_key, None)
+            urgent.pop(old_key, None)
+
+            if source_session is not None:
+                if target_session is None or not merge:
+                    sessions[new_key] = source_session
+                else:
+                    sessions[new_key] = self._merge_sessions(
+                        source_session, target_session
+                    )
+
+            if source_notify:
+                if target_notify is None or not merge:
+                    notify_state[new_key] = source_notify
+                else:
+                    for uid, entry in source_notify.items():
+                        target_notify.setdefault(uid, entry)
+
+            if source_urgent is not None:
+                if target_urgent is None or not merge:
+                    urgent[new_key] = source_urgent
+                else:
+                    urgent[new_key] = self._merge_urgent_targets(
+                        source_urgent, target_urgent
+                    )
+
+            # 锁内只能直接写 KV：save_* 会再取同一把锁，不可重入会死锁。
+            await self._put_kv(SUBSCRIPTIONS_KEY, {"sessions": sessions})
+            await self._put_kv(
+                NOTIFY_STATE_KEY,
+                {
+                    "sessions": {
+                        umo: entries
+                        for umo, entries in notify_state.items()
+                        if entries
+                    }
+                },
+            )
+            await self._put_kv(
+                URGENT_DM_KEY,
+                {
+                    "targets": {
+                        umo: entry for umo, entry in urgent.items() if entry
+                    }
+                },
+            )
+
+            return {
+                "moved": True,
+                "merged": bool(
+                    merge
+                    and (
+                        target_session is not None
+                        or target_urgent is not None
+                        or target_notify
+                    )
+                ),
+                "session": new_key in sessions,
+                "urgent": new_key in urgent,
+                "notify_entries": len(notify_state.get(new_key) or {}),
+            }
+
+    async def migrate_urgent_target(
+        self,
+        old_umo: str,
+        new_umo: str,
+        *,
+        merge: bool = True,
+    ) -> dict[str, Any]:
+        """只把紧急私聊提醒目标搬到新的会话号。"""
+        old_key = str(old_umo or "").strip()
+        new_key = str(new_umo or "").strip()
+        if not old_key or not new_key:
+            raise ValueError("会话号不能为空")
+        if old_key == new_key:
+            raise ValueError("新旧会话号不能相同")
+
+        async with self._lock:
+            urgent = self._normalize_urgent_dm(
+                await self._get_kv(URGENT_DM_KEY, {})
+            )
+            source = urgent.get(old_key)
+            if source is None:
+                return {"moved": False, "merged": False}
+            target = urgent.get(new_key)
+            urgent.pop(old_key, None)
+            if target is None or not merge:
+                urgent[new_key] = source
+            else:
+                urgent[new_key] = self._merge_urgent_targets(source, target)
+            await self._put_kv(
+                URGENT_DM_KEY,
+                {
+                    "targets": {
+                        umo: entry for umo, entry in urgent.items() if entry
+                    }
+                },
+            )
+            return {
+                "moved": True,
+                "merged": bool(merge and target is not None),
+            }
+
+    @staticmethod
+    def _merge_sessions(
+        source: Mapping[str, Any],
+        target: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """把旧会话的订阅并进目标会话：列表取并集，其余保留目标会话的。"""
+        merged = dict(target)
+        merged["games"] = _merge_unique(source.get("games"), target.get("games"))
+        merged["whitelist"] = _merge_unique(
+            source.get("whitelist"),
+            target.get("whitelist"),
+        )
+        merged["blacklist"] = _merge_unique(
+            source.get("blacklist"),
+            target.get("blacklist"),
+        )
+        created = [
+            str(item)
+            for item in (source.get("created_at"), target.get("created_at"))
+            if item
+        ]
+        if created:
+            merged["created_at"] = min(created)
+        return normalize_session(merged)
+
+    @staticmethod
+    def _merge_urgent_targets(
+        source: Mapping[str, Any],
+        target: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """把旧目标的催办进度并进目标记录：节奏、备注保留目标会话的。"""
+        merged = dict(target)
+        merged["games"] = _merge_unique(source.get("games"), target.get("games"))
+        activities = dict(source.get("activities") or {})
+        activities.update(target.get("activities") or {})
+        merged["activities"] = activities
+        return merged
 
     async def update_session(
         self,

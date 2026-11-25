@@ -120,6 +120,7 @@ RESET_TOKENS = {"默认", "default", "重置", "reset"}
 CLEAR_TOKENS = {"清空", "clear", "none"}
 ON_TOKENS = {"开启", "开", "on", "true", "1"}
 OFF_TOKENS = {"关闭", "关", "off", "false", "0"}
+OVERWRITE_TOKENS = {"覆盖", "overwrite", "replace"}
 
 COVER_IMAGE_TOKENS = {"图片", "图", "image", "pic"}
 COVER_LINK_TOKENS = {"链接", "link", "文字", "url"}
@@ -133,6 +134,15 @@ USAGE_COVER = (
     "用法: /活动封面 <图片|链接|关闭|默认>\n"
     "图片 = 直接发送活动封面（默认）；链接 = 只发封面链接文本；\n"
     "关闭 = 完全不附带封面；默认 = 跟随插件全局配置。"
+)
+
+USAGE_MIGRATE = (
+    "用法: /活动迁移 <旧会话号> [覆盖]\n"
+    "换群、换机器人账号之后，旧会话号就再也收不到消息了，把数据搬到当前会话：\n"
+    "/活动迁移 aiocqhttp:GroupMessage:123456789\n"
+    "默认与当前会话已有的数据合并（冲突项以当前会话为准），\n"
+    "结尾加「覆盖」则直接用旧会话的数据覆盖当前会话。\n"
+    "订阅、提醒进度、紧急私聊目标会一起搬走，不会把没结束的活动重新推一遍。"
 )
 
 # 分隔符过长会撑爆消息，这里做一个上限保护
@@ -759,6 +769,59 @@ class GameActivityPlugin(Star):
             message += "\n当前会话已没有订阅的游戏，订阅记录已清除。"
         yield event.plain_result(message)
 
+    @filter.command("活动迁移", alias={"game_migrate", "活动换群"})
+    async def migrate_session(self, event: AstrMessageEvent):
+        """把旧会话的数据迁到当前会话，格式: /活动迁移 <旧会话号> [覆盖]。"""
+        umo = event.unified_msg_origin
+        tokens = self._args(event)
+        if not tokens:
+            yield event.plain_result(f"当前会话号: {umo}\n{USAGE_MIGRATE}")
+            return
+        if not self._event_is_admin(event):
+            yield event.plain_result(
+                "只有管理员能迁移会话数据。\n当前会话号: " + umo
+            )
+            return
+
+        old_umo = tokens[0]
+        if not self._is_umo_token(old_umo):
+            yield event.plain_result(
+                f"「{old_umo}」不像会话号（要形如 aiocqhttp:GroupMessage:123456789）。\n"
+                + USAGE_MIGRATE
+            )
+            return
+        if old_umo == umo:
+            yield event.plain_result("新旧会话号相同，不用迁移。")
+            return
+
+        overwrite = any(
+            token.lower() in OVERWRITE_TOKENS for token in tokens[1:]
+        )
+        try:
+            result = await self.subscriptions.migrate_session(
+                old_umo, umo, merge=not overwrite
+            )
+        except ValueError as exc:
+            yield event.plain_result(str(exc))
+            return
+
+        if not result.get("moved"):
+            yield event.plain_result(
+                f"没有找到 {old_umo} 的任何数据，什么都没改。"
+            )
+            return
+
+        lines = [
+            f"✅ 已把 {old_umo} 的数据迁到当前会话",
+            f"订阅: {'已迁移' if result.get('session') else '无'}",
+            f"提醒进度: {result.get('notify_entries', 0)} 条",
+            f"紧急私聊目标: {'已迁移' if result.get('urgent') else '无'}",
+        ]
+        if result.get("merged"):
+            lines.append("（已与当前会话原有数据合并，冲突项以当前会话为准）")
+        lines.append("下一轮轮询就会按新会话号推送。")
+        yield event.plain_result("\n".join(lines))
+
     @filter.command("活动列表", alias={"game_list", "活动订阅列表"})
     async def list_subscriptions(self, event: AstrMessageEvent):
         """查看当前会话的活动订阅与设置。"""
@@ -805,7 +868,12 @@ class GameActivityPlugin(Star):
             source_name = self.registry.source_name(game.game_id)
             if settings.use_forward_node:
                 forward = await self.delivery.build_overview_forward_chain(
-                    game, activities, now, settings, source_name=source_name
+                    game,
+                    activities,
+                    now,
+                    settings,
+                    source_name=source_name,
+                    umo=umo,
                 )
                 if forward is not None:
                     yield event.chain_result(forward)
@@ -825,6 +893,7 @@ class GameActivityPlugin(Star):
                     forward_title=(
                         f"🎮 {display_game_name(game, settings)} · 当前活动"
                     ),
+                    umo=umo,
                 )
             )
 

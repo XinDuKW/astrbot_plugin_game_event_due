@@ -270,7 +270,29 @@ function renderDetail() {
 
   elements.detailView.innerHTML = `
     <h2>${escapeHtml(session.session_name)}</h2>
-    <div class="detail-umo">${escapeHtml(session.umo)}</div>
+    <div class="detail-umo">
+      <span>${escapeHtml(session.umo)}</span>
+      <button type="button" class="ghost-button" id="umo-migrate-toggle">改会话号</button>
+    </div>
+    <div class="umo-migrate is-hidden" id="umo-migrate">
+      <p class="field-hint">
+        换群、换机器人账号之后，旧会话号就收不到消息了。把当前会话的数据搬到新会话号：
+        订阅、提醒进度、紧急私聊目标会一起搬走，不会把没结束的活动重新推一遍。
+      </p>
+      <div class="field-row">
+        <label for="field-umo-target">新会话号</label>
+        <input type="text" id="field-umo-target"
+          placeholder="例如 aiocqhttp:GroupMessage:123456789" />
+      </div>
+      <label class="toggle">
+        <input type="checkbox" id="field-umo-merge" checked />
+        <span>与目标会话已有数据合并（不勾选则直接覆盖）</span>
+      </label>
+      <div class="detail-actions">
+        <button type="button" class="primary-button" id="umo-migrate-apply">迁移</button>
+        <button type="button" id="umo-migrate-cancel">取消</button>
+      </div>
+    </div>
 
     <form class="detail-form" id="detail-form">
       <div class="field-group">
@@ -377,6 +399,25 @@ function renderDetail() {
         post("session/remove", { umo: session.umo }, "已移除该会话的订阅"),
       );
     });
+
+  const umoToggle = document.getElementById("umo-migrate-toggle");
+  const umoPanel = document.getElementById("umo-migrate");
+  if (umoToggle && umoPanel) {
+    umoToggle.addEventListener("click", () => {
+      umoPanel.classList.toggle("is-hidden");
+    });
+    document
+      .getElementById("umo-migrate-cancel")
+      .addEventListener("click", () => {
+        umoPanel.classList.add("is-hidden");
+        document.getElementById("field-umo-target").value = "";
+      });
+    document
+      .getElementById("umo-migrate-apply")
+      .addEventListener("click", (event) => {
+        migrateSession(session, event.currentTarget);
+      });
+  }
 }
 
 function parseThresholds(text) {
@@ -445,6 +486,37 @@ async function previewGame(session) {
     output.textContent = `获取失败：${error?.message || error}`;
   } finally {
     setSaving(false);
+  }
+}
+
+async function migrateSession(session, button) {
+  if (!bridge) return;
+  const input = document.getElementById("field-umo-target");
+  const target = (input && input.value ? input.value : "").trim();
+  if (!target) {
+    showToast("先填一个新的会话号", true);
+    return;
+  }
+  if (target === session.umo) {
+    showToast("新旧会话号相同，不用迁移", true);
+    return;
+  }
+  const mergeNode = document.getElementById("field-umo-merge");
+  button.classList.add("is-loading");
+  try {
+    await bridge.apiPost("session/migrate", {
+      umo: session.umo,
+      target_umo: target,
+      merge: mergeNode ? mergeNode.checked : true,
+    });
+    // 迁移完旧会话已经不在列表里了，直接选中新会话，免得跳回第一个
+    state.selectedUmo = target;
+    showToast("已迁移到 " + target);
+    await loadOverview();
+  } catch (error) {
+    showToast(error?.message || "迁移失败", true);
+  } finally {
+    button.classList.remove("is-loading");
   }
 }
 
@@ -1371,6 +1443,7 @@ function renderUrgentCard(target) {
         ? '      <button class="ghost-button" type="button" data-urgent-ack-clear="1">解除确认（' +
           escapeHtml(String(ackedCount)) + "）</button>"
         : "",
+    '      <button class="ghost-button" type="button" data-urgent-migrate="1">改会话号</button>',
     '      <button class="ghost-button" type="button" data-urgent-save="1">保存</button>',
     '      <button class="ghost-button is-danger" type="button" data-urgent-remove="1">移除</button>',
     "    </div>",
@@ -1392,6 +1465,17 @@ function renderUrgentCard(target) {
             "</ul></details>"
           : "")
       : '  <p class="field-hint">还没有催过活动；一旦有活动进入档位，这里会列出进度。</p>',
+    '  <div class="umo-migrate is-hidden" data-urgent-migrate-panel="1">',
+    '    <div class="field-row">',
+    '      <label>新会话号</label>',
+    '      <input type="text" data-urgent-migrate-target="1" placeholder="例如 aiocqhttp:FriendMessage:123456789" />',
+    "    </div>",
+    '    <label class="toggle">',
+    '      <input type="checkbox" data-urgent-migrate-merge="1" checked />',
+    "      <span>与目标已有数据合并</span>",
+    "    </label>",
+    '    <button class="primary-button" type="button" data-urgent-migrate-apply="1">迁移</button>',
+    "  </div>",
     "</article>",
   ].join("");
 }
@@ -1517,6 +1601,32 @@ async function clearUrgentAck(card, uid, button) {
   }
 }
 
+async function migrateUrgentCard(card, button) {
+  if (!bridge) return;
+  const input = card.querySelector("[data-urgent-migrate-target]");
+  const target = (input && input.value ? input.value : "").trim();
+  if (!target) {
+    setUrgentNote("先填一个新的会话号", true);
+    return;
+  }
+  const mergeNode = card.querySelector("[data-urgent-migrate-merge]");
+  button.classList.add("is-loading");
+  try {
+    await bridge.apiPost("urgent-migrate", {
+      umo: card.dataset.urgentCard,
+      target_umo: target,
+      merge: mergeNode ? mergeNode.checked : true,
+    });
+    setUrgentNote("已迁移到 " + target);
+    showToast("已迁移到 " + target);
+    await loadUrgent();
+  } catch (error) {
+    setUrgentNote(error?.message || "迁移失败", true);
+  } finally {
+    button.classList.remove("is-loading");
+  }
+}
+
 async function addUrgentTarget() {
   if (!bridge) return;
   const umo = (urgentState.elements.newUmo.value || "").trim();
@@ -1551,6 +1661,17 @@ urgentState.elements.list.addEventListener("click", (event) => {
   const ackAllButton = event.target.closest("[data-urgent-ack-clear]");
   if (ackAllButton) {
     clearUrgentAck(card, "", ackAllButton);
+    return;
+  }
+  const migrateToggle = event.target.closest("[data-urgent-migrate]");
+  if (migrateToggle) {
+    const panel = card.querySelector("[data-urgent-migrate-panel]");
+    if (panel) panel.classList.toggle("is-hidden");
+    return;
+  }
+  const migrateApply = event.target.closest("[data-urgent-migrate-apply]");
+  if (migrateApply) {
+    migrateUrgentCard(card, migrateApply);
     return;
   }
   const removeButton = event.target.closest("[data-urgent-remove]");

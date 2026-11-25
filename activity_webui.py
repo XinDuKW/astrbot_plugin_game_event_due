@@ -67,6 +67,7 @@ class ActivityWebUIController:
             ("overview", self.overview, ["GET"], "游戏活动订阅概览"),
             ("session/update", self.update_session, ["POST"], "修改活动订阅设置"),
             ("session/remove", self.remove_session, ["POST"], "移除活动订阅"),
+            ("session/migrate", self.migrate_session, ["POST"], "迁移会话数据"),
             ("preview", self.preview, ["POST"], "预览某个游戏的当前活动"),
             ("template", self.template, ["GET"], "读取消息模板配置"),
             ("template-preview", self.template_preview, ["POST"], "按草稿模板预览排版"),
@@ -76,6 +77,7 @@ class ActivityWebUIController:
             ("settings-save", self.settings_save, ["POST"], "保存数据源与代理设置"),
             ("urgent-targets", self.urgent_targets, ["GET"], "读取紧急私聊提醒配置"),
             ("urgent-save", self.urgent_save, ["POST"], "保存紧急私聊提醒配置"),
+            ("urgent-migrate", self.migrate_urgent, ["POST"], "迁移紧急私聊提醒目标"),
         )
         for endpoint, handler, methods, description in routes:
             self.context.register_web_api(
@@ -385,6 +387,93 @@ class ActivityWebUIController:
         self.plugin.subscriptions.drop_session_state(notify_state, umo)
         await self.plugin.subscriptions.save_notify_state(notify_state)
         return json_response({"removed": True, "umo": umo})
+
+    async def migrate_session(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求内容必须是 JSON 对象", status_code=400)
+
+        source = payload.get("umo")
+        target = payload.get("target_umo")
+        if self._parse_umo(source) is None:
+            return error_response("原会话 UMO 格式不正确", status_code=400)
+        if self._parse_umo(target) is None:
+            return error_response("新会话 UMO 格式不正确", status_code=400)
+        if source == target:
+            return error_response("新旧会话号不能相同", status_code=400)
+
+        merge = payload.get("merge", True)
+        if not isinstance(merge, bool):
+            merge = str(merge).strip().lower() not in {
+                "0",
+                "false",
+                "off",
+                "no",
+                "",
+            }
+        try:
+            result = await self.plugin.subscriptions.migrate_session(
+                source,
+                target,
+                merge=merge,
+            )
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        if not result.get("moved"):
+            return error_response("没有找到这个会话的数据", status_code=404)
+        return json_response(
+            {
+                "migrated": True,
+                "umo": source,
+                "target_umo": target,
+                "session": bool(result.get("session")),
+                "urgent": bool(result.get("urgent")),
+                "notify_entries": int(result.get("notify_entries") or 0),
+                "merged": bool(result.get("merged")),
+            }
+        )
+
+    async def migrate_urgent(self):
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求内容必须是 JSON 对象", status_code=400)
+
+        source = payload.get("umo")
+        target = payload.get("target_umo")
+        if self._parse_umo(source) is None:
+            return error_response("原会话 UMO 格式不正确", status_code=400)
+        if self._parse_umo(target) is None:
+            return error_response("新会话 UMO 格式不正确", status_code=400)
+        if source == target:
+            return error_response("新旧会话号不能相同", status_code=400)
+
+        merge = payload.get("merge", True)
+        if not isinstance(merge, bool):
+            merge = str(merge).strip().lower() not in {
+                "0",
+                "false",
+                "off",
+                "no",
+                "",
+            }
+        try:
+            result = await self.plugin.subscriptions.migrate_urgent_target(
+                source,
+                target,
+                merge=merge,
+            )
+        except ValueError as exc:
+            return error_response(str(exc), status_code=400)
+        if not result.get("moved"):
+            return error_response("没有找到这个紧急提醒目标", status_code=404)
+        return json_response(
+            {
+                "migrated": True,
+                "umo": source,
+                "target_umo": target,
+                "merged": bool(result.get("merged")),
+            }
+        )
 
     async def preview(self):
         payload = await request.json(default={})

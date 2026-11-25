@@ -11,6 +11,7 @@ from astrbot_plugin_game_event_due.services.delivery_service import (
     ActivityDeliveryService,
 )
 from astrbot_plugin_game_event_due.services.message_formatter import (
+    MessagePart,
     MessageSettings,
     build_urgent_dm_groups,
     build_urgent_dm_title,
@@ -114,6 +115,50 @@ def test_forward_chain_named_needs_at_least_two_nodes():
     )
     assert pair is not None
     assert len(pair) == 1
+
+
+def test_supports_forward_only_on_aiocqhttp():
+    assert ActivityDeliveryService.supports_forward(UMO) is True
+    assert ActivityDeliveryService.supports_forward("aiocqhttp:GroupMessage:1")
+    # QQ 官方机器人会忽略 Node/Nodes 且不报错，整条消息会被静默丢弃
+    assert ActivityDeliveryService.supports_forward("qq_official:FriendMessage:x") is False
+    assert ActivityDeliveryService.supports_forward("telegram:FriendMessage:1") is False
+    assert ActivityDeliveryService.supports_forward("") is False
+
+
+def test_urgent_forward_on_qq_official_falls_back_to_plain_message():
+    context = FakeContext()
+    service = ActivityDeliveryService(context, SETTINGS, resolver=None)
+    groups = urgent_groups()
+    delivered = asyncio.run(
+        service.send_urgent_forward(
+            "qq_official:FriendMessage:abc",
+            groups,
+            NOW,
+            SETTINGS,
+            title=build_urgent_dm_title(groups, SETTINGS),
+            ack_hint=ACK_HINT,
+        )
+    )
+    # 返回 False 让调用方回退普通消息；这里什么都不该发
+    assert delivered is False
+    assert context.sent == []
+
+
+def test_send_parts_on_qq_official_never_builds_forward_nodes():
+    context = FakeContext()
+    service = ActivityDeliveryService(context, SETTINGS, resolver=None)
+    settings = MessageSettings(use_forward_node=True)
+    ok = asyncio.run(
+        service.send_parts(
+            "qq_official:GroupMessage:g1",
+            [MessagePart("text", "普通消息")],
+            settings,
+        )
+    )
+    assert ok is True
+    _, chain = context.sent[0]
+    assert all(isinstance(item, Comp.Plain) for item in chain.chain)
 
 
 def test_urgent_forward_without_groups_sends_nothing():

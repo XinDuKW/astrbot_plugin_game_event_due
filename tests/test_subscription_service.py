@@ -268,3 +268,140 @@ def test_drop_session_state():
     data = {UMO: {"sr|a1": {"new": True}}}
     SubscriptionService.drop_session_state(data, UMO)
     assert data == {}
+
+# ---- 会话迁移（换群 / 换机器人账号） ----
+
+OLD = "aiocqhttp:GroupMessage:111111"
+NEW = "aiocqhttp:GroupMessage:222222"
+
+
+async def _seed(service: SubscriptionService) -> None:
+    await service.add_games(OLD, ["sr", "ys"])
+    await service.update_session(OLD, {"thresholds": [5, 2]})
+    await service.save_notify_state({OLD: {"sr|a1": {"new": True, "tier": "d3"}}})
+    urgent = await service.get_urgent_dm()
+    SubscriptionService.upsert_urgent_target(urgent, OLD, games=["sr"])
+    await service.save_urgent_dm(urgent)
+
+
+@pytest.mark.anyio
+async def test_migrate_session_moves_all_three_kv():
+    service, _ = make_service()
+    await _seed(service)
+
+    result = await service.migrate_session(OLD, NEW)
+
+    assert result["moved"] is True
+    assert result["session"] is True
+    assert result["urgent"] is True
+    assert result["notify_entries"] == 1
+    assert result["merged"] is False
+
+    assert await service.get_session(OLD) is None
+    session = await service.get_session(NEW)
+    assert session is not None
+    assert session["games"] == ["sr", "ys"]
+    assert set(session["thresholds"]) == {5, 2}
+
+    states = await service.get_notify_state()
+    assert OLD not in states
+    assert states[NEW]["sr|a1"]["tier"] == "d3"
+
+    urgent = await service.get_urgent_dm()
+    assert OLD not in urgent
+    assert urgent[NEW]["games"] == ["sr"]
+
+
+@pytest.mark.anyio
+async def test_migrate_session_merges_into_existing_target():
+    service, _ = make_service()
+    await _seed(service)
+    await service.add_games(NEW, ["ww"])
+    await service.update_session(NEW, {"thresholds": [7], "blacklist": ["签到"]})
+    # save_notify_state 是整体写入，必须先读再写，否则会把旧会话的进度一起清掉
+    states = await service.get_notify_state()
+    states.setdefault(NEW, {})["ww|b1"] = {"new": True}
+    await service.save_notify_state(states)
+
+    result = await service.migrate_session(OLD, NEW)
+
+    assert result["merged"] is True
+    assert result["notify_entries"] == 2
+    session = await service.get_session(NEW)
+    assert session["games"] == ["sr", "ys", "ww"]
+    # 冲突项以目标会话为准
+    assert set(session["thresholds"]) == {7}
+    assert session["blacklist"] == ["签到"]
+    states = await service.get_notify_state()
+    assert set(states[NEW]) == {"sr|a1", "ww|b1"}
+
+
+@pytest.mark.anyio
+async def test_migrate_session_overwrite_replaces_target():
+    service, _ = make_service()
+    await _seed(service)
+    await service.add_games(NEW, ["ww"])
+    await service.update_session(NEW, {"thresholds": [7]})
+
+    await service.migrate_session(OLD, NEW, merge=False)
+
+    session = await service.get_session(NEW)
+    assert session["games"] == ["sr", "ys"]
+    assert set(session["thresholds"]) == {5, 2}
+
+
+@pytest.mark.anyio
+async def test_migrate_session_without_source_changes_nothing():
+    service, kv = make_service()
+    await service.add_games(NEW, ["ww"])
+    await service.save_notify_state({NEW: {"ww|b1": {"new": True}}})
+    before = dict(kv.store)
+
+    result = await service.migrate_session(OLD, NEW)
+
+    assert result["moved"] is False
+    assert kv.store == before
+
+
+@pytest.mark.anyio
+async def test_migrate_session_rejects_same_umo():
+    service, _ = make_service()
+    await _seed(service)
+    with pytest.raises(ValueError):
+        await service.migrate_session(OLD, OLD)
+
+
+@pytest.mark.anyio
+async def test_migrate_urgent_target_keeps_subscriptions():
+    service, _ = make_service()
+    await _seed(service)
+
+    result = await service.migrate_urgent_target(OLD, NEW)
+
+    assert result["moved"] is True
+    assert await service.get_session(OLD) is not None
+    urgent = await service.get_urgent_dm()
+    assert OLD not in urgent
+    assert NEW in urgent
+
+
+@pytest.mark.anyio
+async def test_migrate_urgent_target_merges_progress():
+    service, _ = make_service()
+    urgent = await service.get_urgent_dm()
+    SubscriptionService.upsert_urgent_target(urgent, OLD, games=["sr"])
+    urgent[OLD]["activities"] = {"sr|a1": {"sent_total": 3}}
+    SubscriptionService.upsert_urgent_target(urgent, NEW, games=["ww"])
+    urgent[NEW]["activities"] = {
+        "sr|a1": {"sent_total": 9},
+        "ww|b1": {"sent_total": 1},
+    }
+    await service.save_urgent_dm(urgent)
+
+    await service.migrate_urgent_target(OLD, NEW)
+
+    merged = (await service.get_urgent_dm())[NEW]
+    assert merged["games"] == ["sr", "ww"]
+    # 目标已有进度优先
+    assert merged["activities"]["sr|a1"]["sent_total"] == 9
+    assert merged["activities"]["ww|b1"]["sent_total"] == 1
