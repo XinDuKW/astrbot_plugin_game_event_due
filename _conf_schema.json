@@ -224,6 +224,51 @@
         "type": "string",
         "default": "",
         "hint": "写游戏代号，例如 sr,genshin；用 /活动游戏 查看代号。留空表示跟随当前被订阅的游戏。"
+      },
+      "ack_button": {
+        "description": "提醒里带「我已知晓」按钮",
+        "type": "bool",
+        "default": true,
+        "hint": "仅 QQ 官方机器人（qq_official / qq_official_webhook）支持：提醒末尾挂一个按钮，点一下就等于回了一句 /我已知晓，不用打字。其它平台会自动忽略这一项。"
+      },
+      "ack_button_confirm": {
+        "description": "点按钮后再确认一次（可确认也可反悔）",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后点「我已知晓」不会立刻停提醒，而是再发一条消息，里面并排放「确认不再提醒」（红色，真停）和「取消确认」（灰色，反悔后照常催）；防手滑。QQ 官方没有更新已发消息按钮的接口，所以这一行按钮在第二条消息里，不是原地变字。"
+      },
+      "detail_button": {
+        "description": "活动多时先发摘要 +「看详情」按钮",
+        "type": "bool",
+        "default": true,
+        "hint": "同时要结束的活动达到「几个活动起改发摘要」时，只发一条摘要（几个活动、哪些游戏、最急的是哪个），下面挂每个游戏 +「全部」按钮，点了才发详细排版。官方机器人没有合并转发可用，靠这个防刷屏；OneBot 不受影响，继续用合并转发。"
+      },
+      "detail_min": {
+        "description": "几个活动起改发摘要",
+        "type": "int",
+        "default": 3,
+        "hint": "少于这个数量直接发完整详情（带封面）。最小 2；填很大的值等于永远发完整详情。"
+      },
+      "detail_target": {
+        "description": "详情发到哪里",
+        "type": "string",
+        "default": "private",
+        "options": [
+          "auto",
+          "private"
+        ],
+        "hint": "private=一律只发到点按钮那个人的私聊（默认，免得在群里点一下就把一堆活动刷进群；私聊发不出去时会回落到当前会话）；auto=点到哪发到哪。"
+      },
+      "certification": {
+        "description": "QQ 官方机器人的认证类型",
+        "type": "string",
+        "default": "unknown",
+        "options": [
+          "unknown",
+          "personal",
+          "enterprise"
+        ],
+        "hint": "只影响「主动私聊发不出去」时给你哪条提示。个人认证的机器人加不了好友，得先在开放平台「开发体验号码设置」里把使用者的 QQ 号加进体验成员（最多 20 个）；企业认证一般可直接私聊。平台接口读不到认证类型，所以需要你自己选。"
       }
     }
   },
@@ -243,6 +288,22 @@
         "type": "string",
         "default": "━━━━━━━━━━━━",
         "hint": "同一条消息里推送多个活动时，插在相邻活动之间，让边界更明显。留空则只用空行分隔。也可以改成自己喜欢的样式，例如「------」或「════════」。最长 40 个字符。"
+      },
+      "markdown_mode": {
+        "description": "消息排版方式",
+        "type": "string",
+        "default": "auto",
+        "options": [
+          "auto",
+          "on",
+          "off"
+        ],
+        "labels": [
+          "自动（按平台）",
+          "强制 Markdown",
+          "始终纯文本"
+        ],
+        "hint": "auto=QQ 官方机器人用 Markdown 排版、其它平台用纯文本；on=所有平台都强制 Markdown；off=关闭。Markdown 模式只用一条消息排版，封面改为链接、不使用合并转发；某些客户端会把 # 和星号原样显示，看到这种情况就关掉。"
       },
       "cover_mode": {
         "description": "活动封面处理方式",
@@ -337,6 +398,12 @@
         "type": "bool",
         "default": false,
         "hint": "默认关闭：活动带封面图时不再输出「详情：链接」。没有封面的活动仍会给出链接；封面模式为「链接」时不受影响。"
+      },
+      "markdown_cover_limit": {
+        "description": "Markdown 最多内嵌几张封面",
+        "type": "int",
+        "default": 1,
+        "hint": "QQ 官方机器人的 markdown 没有公开长度上限，一条消息里塞很多 ![]() 很可能被截断或静默丢图。默认只把第一张封面内嵌成图，其余退回「封面图」链接；0 = 一张都不嵌，全用链接。上限 20。"
       },
       "game_aliases": {
         "description": "自定义游戏显示名称",

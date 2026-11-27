@@ -153,6 +153,61 @@ class StubNodes:
         return f"Nodes({len(self.nodes)})"
 
 
+class StubCallbackAction:
+    """``Comp.Button.CallbackAction`` 的替身。"""
+
+    def __init__(self, data: object = None, **_: object) -> None:
+        self.type = "callback"
+        self.data = data
+
+    def __repr__(self) -> str:
+        return f"CallbackAction({self.data!r})"
+
+
+class StubButton:
+    """``Comp.Button`` 的替身：只保留 id / label / action / style。"""
+
+    class Style:
+        DEFAULT = "default"
+        PRIMARY = "primary"
+        SUCCESS = "success"
+        DANGER = "danger"
+
+    CallbackAction = StubCallbackAction
+
+    def __init__(
+        self,
+        id: str = "",
+        label: str = "",
+        action: object = None,
+        style: str = "default",
+    ) -> None:
+        self.id = id
+        self.label = label
+        self.action = action
+        self.style = style
+
+    def __repr__(self) -> str:
+        return f"Button({self.id!r}, {self.label!r})"
+
+
+class StubActionRow:
+    """``Comp.ActionRow`` 的替身。"""
+
+    def __init__(
+        self,
+        buttons: object = None,
+        fallback_text: str | None = None,
+        action_timeout: float | None = None,
+    ) -> None:
+        self.buttons = list(buttons or [])
+        self.fallback_text = fallback_text
+        self.action_timeout = action_timeout
+
+    def __repr__(self) -> str:
+        return f"ActionRow({len(self.buttons)})"
+
+
 class StubMessageChain:
     """``MessageChain`` 的替身。"""
 
@@ -181,6 +236,8 @@ def _install_astrbot_stub() -> None:
     components_module.Image = StubImage  # type: ignore[attr-defined]
     components_module.Node = StubNode  # type: ignore[attr-defined]
     components_module.Nodes = StubNodes  # type: ignore[attr-defined]
+    components_module.Button = StubButton  # type: ignore[attr-defined]
+    components_module.ActionRow = StubActionRow  # type: ignore[attr-defined]
 
     event_module = types.ModuleType("astrbot.api.event")
     event_module.MessageChain = StubMessageChain  # type: ignore[attr-defined]

@@ -6,6 +6,56 @@ const COVER_LABELS = {
   off: "不附带封面",
 };
 
+const MARKDOWN_LABELS = {
+  auto: "自动（按平台）",
+  on: "强制 Markdown",
+  off: "始终纯文本",
+};
+
+const CERTIFICATION_LABELS = {
+  unknown: "不确定",
+  personal: "个人认证",
+  enterprise: "企业认证",
+};
+
+const PLATFORM_LABELS = {
+  auto: "自动（按已订阅平台）",
+  aiocqhttp: "Onebot / NapCat（普通消息 · 合并转发）",
+  qq_official: "QQ 官方机器人（Markdown）",
+  qq_official_webhook: "QQ 官方机器人 Webhook（Markdown）",
+};
+
+function platformLabel(value) {
+  return PLATFORM_LABELS[value] || value;
+}
+
+// 「预览」只影响编辑器右栏画哪一种，不写插件配置；存本机浏览器，下次打开还是上次那个。
+const PREVIEW_PLATFORM_KEY = "gameEventDue.previewPlatform";
+
+function loadPreviewPlatform() {
+  try {
+    return String(window.localStorage.getItem(PREVIEW_PLATFORM_KEY) || "").trim();
+  } catch (error) {
+    return "";
+  }
+}
+
+function savePreviewPlatform(value) {
+  try {
+    window.localStorage.setItem(PREVIEW_PLATFORM_KEY, String(value || "auto"));
+  } catch (error) {
+    /* 隐私模式 / 禁用存储时忽略，预览照常按「自动」走 */
+  }
+}
+
+function previewPlatformChoices() {
+  return ["auto"].concat(
+    templateState.platforms.length
+      ? templateState.platforms
+      : ["aiocqhttp", "qq_official"],
+  );
+}
+
 const elements = {
   runtimeStatus: document.getElementById("runtime-status"),
   refreshButton: document.getElementById("refresh-button"),
@@ -552,6 +602,8 @@ const TEMPLATE_FIELDS = [
         label: "使用合并转发",
         hint: "关闭后按游戏合并成一条普通消息；开启后每个活动一个转发节点。",
         type: "switch",
+        // 强制 Markdown 时插件一定不用合并转发（两者混用会把 ** 原样塞进节点）
+        notMarkdown: true,
       },
       {
         key: "forward_node_name",
@@ -559,6 +611,7 @@ const TEMPLATE_FIELDS = [
         hint: "普通消息模式下这条消息的显示名，建议 4 字以内。",
         type: "text",
         placeholder: "活动提醒",
+        notMarkdown: true,
       },
       {
         key: "cover_mode",
@@ -571,6 +624,17 @@ const TEMPLATE_FIELDS = [
         label: "图片模式也附详情链接",
         hint: "开启后即使已经发了封面图，也会再补一行详情链接。",
         type: "switch",
+        // Markdown 只发一条消息、封面直接内嵌，这个开关不影响结果
+        notMarkdown: true,
+      },
+      {
+        key: "markdown_cover_limit",
+        label: "Markdown 最多内嵌几张封面",
+        hint: "默认 1 张，其余退回链接；0 = 一张都不嵌。塞太多可能被平台截断或丢图。",
+        type: "text",
+        placeholder: "1",
+        // 只有 Markdown 会把封面塞进正文
+        onlyMarkdown: true,
       },
     ],
   },
@@ -648,6 +712,7 @@ const TEMPLATE_FIELDS = [
         label: "转发节点用简称",
         hint: "关掉后节点名用完整游戏名。",
         type: "switch",
+        notMarkdown: true,
       },
       {
         key: "game_short_names",
@@ -673,6 +738,9 @@ const templateState = {
   preview: null,
   games: [],
   coverModes: ["image", "link", "off"],
+  platforms: [],
+  previewPlatform: "auto",
+  certification: "unknown",
   gameId: "",
   urgentGames: 3,
   timer: null,
@@ -684,6 +752,7 @@ templateState.elements = {
   close: document.getElementById("template-close"),
   controls: document.getElementById("template-controls"),
   preview: document.getElementById("template-preview"),
+  headExtra: document.getElementById("template-head-extra"),
   note: document.getElementById("template-note"),
   reset: document.getElementById("template-reset"),
   save: document.getElementById("template-save"),
@@ -711,12 +780,13 @@ function renderField(item) {
     ].join("");
   }
   if (item.type === "select") {
+    const labels = item.labels || COVER_LABELS;
     const options = (item.options || templateState.coverModes)
       .map((option) => {
         const optionValue = typeof option === "string" ? option : option.value;
         const optionLabel =
           typeof option === "string"
-            ? COVER_LABELS[option] || option
+            ? labels[option] || option
             : option.label;
         const selected = String(value) === String(optionValue) ? " selected" : "";
         return (
@@ -762,6 +832,118 @@ function renderField(item) {
   ].join("");
 }
 
+function renderHeadExtra() {
+  const host = templateState.elements.headExtra;
+  if (!host) return;
+  const platformOptions = previewPlatformChoices()
+    .map(
+      (value) =>
+        '<option value="' + escapeHtml(value) + '"' +
+        (templateState.previewPlatform === value ? " selected" : "") +
+        ">" + escapeHtml(platformLabel(value)) + "</option>",
+    )
+    .join("");
+  const markdownValue =
+    (templateState.values && templateState.values.markdown_mode) || "auto";
+  const markdownOptions = ["auto", "on", "off"]
+    .map(
+      (value) =>
+        '<option value="' + value + '"' +
+        (markdownValue === value ? " selected" : "") +
+        ">" + escapeHtml(MARKDOWN_LABELS[value] || value) + "</option>",
+    )
+    .join("");
+  const certValue = templateState.certification || "unknown";
+  const certOptions = ["unknown", "personal", "enterprise"]
+    .map(
+      (value) =>
+        '<option value="' + value + '"' +
+        (certValue === value ? " selected" : "") +
+        ">" + escapeHtml(CERTIFICATION_LABELS[value] || value) + "</option>",
+    )
+    .join("");
+  const pane = effectivePane(templateState.preview);
+  const hint =
+    templateState.platforms.length > 1
+      ? '<span class="modal-head-hint" title="' +
+        escapeHtml(templateState.platforms.join(" / ")) +
+        '">' + escapeHtml(templateState.platforms.join(" / ")) + "</span>"
+      : "";
+  host.innerHTML =
+    hint +
+    '<label class="modal-head-select" title="只影响「主动私聊发不出去」时给哪条提示。个人认证的机器人要先在开放平台「开发体验号码设置」里把使用者的 QQ 号加进体验成员（最多 20 个）才打得开私聊；企业认证一般没这个限制。平台接口读不到认证类型，所以自己选。">' +
+    "<span>认证</span>" +
+    '<select id="tmpl-certification">' + certOptions + "</select></label>" +
+    '<label class="modal-head-select" title="auto=QQ 官方机器人用 Markdown、其它平台纯文本；on=所有平台强制；off=关闭。Markdown 模式只用一条消息排版，封面改成链接，也不用合并转发。">' +
+    "<span>排版</span>" +
+    '<select id="tmpl-markdown-mode">' + markdownOptions + "</select></label>" +
+    '<label class="modal-head-select" title="右边只画这个平台实际会发的那一种：Onebot 侧是普通消息或合并转发（由「使用合并转发」决定），QQ 官方机器人侧是 Markdown。">' +
+    "<span>预览</span>" +
+    '<select id="tmpl-platform">' + platformOptions + "</select></label>";
+  const certSelect = host.querySelector("#tmpl-certification");
+  if (certSelect) {
+    certSelect.addEventListener("change", async () => {
+      const value = certSelect.value || "unknown";
+      templateState.certification = value;
+      try {
+        const data = await bridge.apiPost("certification-save", {
+          certification: value,
+        });
+        templateState.certification =
+          (data && data.certification) || value;
+        renderHeadExtra();
+        setTemplateNote(
+          "已保存认证类型：" +
+            (CERTIFICATION_LABELS[templateState.certification] ||
+              templateState.certification),
+        );
+      } catch (error) {
+        setTemplateNote(
+          error && error.message ? error.message : "保存认证类型失败",
+          true,
+        );
+        renderHeadExtra();
+      }
+    });
+  }
+  const modeSelect = host.querySelector("#tmpl-markdown-mode");
+  if (modeSelect) {
+    modeSelect.addEventListener("change", async () => {
+      const value = modeSelect.value || "auto";
+      templateState.values = collectTemplateValues();
+      templateState.values.markdown_mode = value;
+      // 排版方式会决定左栏藏哪些选项，改完要整块重画
+      renderTemplateControls();
+      refreshTemplatePreview();
+      try {
+        const data = await bridge.apiPost("markdown-mode-save", {
+          markdown_mode: value,
+        });
+        const saved = (data && data.markdown_mode) || value;
+        templateState.values.markdown_mode = saved;
+        setTemplateNote(
+          "已保存排版方式：" + (MARKDOWN_LABELS[saved] || saved),
+        );
+        renderTemplateControls();
+        refreshTemplatePreview();
+      } catch (error) {
+        setTemplateNote(
+          error && error.message ? error.message : "保存排版方式失败",
+          true,
+        );
+      }
+    });
+  }
+  const select = host.querySelector("#tmpl-platform");
+  if (select) {
+    select.addEventListener("change", () => {
+      templateState.previewPlatform = select.value || "auto";
+      savePreviewPlatform(templateState.previewPlatform);
+      refreshTemplatePreview();
+    });
+  }
+}
+
 function renderTemplateControls() {
   const gameOptions = [
     '<option value="">示例活动（离线）</option>',
@@ -800,15 +982,32 @@ function renderTemplateControls() {
     '  <button class="ghost-button" type="button" data-tmpl-jump="urgent">看右侧的紧急提醒预览 ↓</button>',
     "</div>",
   ].join("");
-  const sections = TEMPLATE_FIELDS.map((section) =>
-    [
+  // 强制 Markdown 时合并转发 / 转发节点名这些选项对结果毫无影响，直接藏起来
+  const markdownForced = !!(
+    templateState.values && templateState.values.markdown_mode === "on"
+  );
+  const sections = TEMPLATE_FIELDS.map((section) => {
+    const items = section.items.filter(
+      (item) =>
+        !(markdownForced && item.notMarkdown) &&
+        // onlyMarkdown 的项只在强制 Markdown 下才有意义
+        !(item.onlyMarkdown && !markdownForced),
+    );
+    return [
       '<section class="tmpl-group">',
       '  <h3 class="tmpl-group-title">' + escapeHtml(section.group) + "</h3>",
-      section.items.map(renderField).join(""),
+      items.map(renderField).join(""),
       "</section>",
-    ].join(""),
-  ).join("");
-  templateState.elements.controls.innerHTML = gameField + urgentField + sections;
+    ].join("");
+  }).join("");
+  const forcedNote = markdownForced
+    ? '<p class="tmpl-forced-note">强制 Markdown 只发一条消息、封面直接内嵌，' +
+      "合并转发 / 转发节点名 / 图片模式详情链接这些在 Markdown 下不起作用的选项已经藏起来了" +
+      "（配置值没动，切回自动或关闭就回来）。</p>"
+    : "";
+  templateState.elements.controls.innerHTML =
+    gameField + urgentField + sections + forcedNote;
+  renderHeadExtra();
   bindTemplateInputs();
 }
 
@@ -850,6 +1049,8 @@ function collectTemplateValues() {
       if (!key) return;
       values[key] = node.type === "checkbox" ? node.checked : node.value;
     });
+  const headMode = document.getElementById("tmpl-markdown-mode");
+  if (headMode) values.markdown_mode = headMode.value;
   return values;
 }
 
@@ -870,6 +1071,7 @@ async function refreshTemplatePreview() {
       values: templateState.values,
       game_id: templateState.gameId || "",
       urgent_games: templateState.urgentGames || 3,
+      preview_platform: templateState.previewPlatform || "auto",
     });
     templateState.preview = preview;
     renderTemplatePreview(preview);
@@ -927,6 +1129,54 @@ function renderPlainBubble(preview) {
   return renderMessageFrame(preview, bubble);
 }
 
+function inlineMarkdown(value) {
+  // 先转义再替换标记：预览只用极简渲染，不做完整 Markdown 解析
+  return (
+    escapeHtml(value)
+      // 图片必须排在链接前面，否则 ![]() 里的 []() 会先被链接规则吃掉
+      .replace(
+        /!\[([^\]]*)\]\(([^)\s]+)\)/g,
+        '<img class="qq-md-image" src="$2" alt="$1" loading="lazy" referrerpolicy="no-referrer" />',
+      )
+      .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+      .replace(
+        /\[([^\]]+)\]\(([^)\s]+)\)/g,
+        '<a href="$2" target="_blank" rel="noreferrer">$1</a>',
+      )
+  );
+}
+
+function renderMarkdownLines(text) {
+  return String(text || "")
+    .split("\n")
+    .map((raw) => {
+      const line = raw.replace(/\s+$/, "");
+      if (!line) return '<div class="qq-line"></div>';
+      if (line === "***") return '<div class="qq-separator">━━━━━━</div>';
+      if (line.startsWith("### ")) {
+        return '<div class="qq-heading">' + inlineMarkdown(line.slice(4)) + "</div>";
+      }
+      if (line.startsWith("## ")) {
+        return (
+          '<div class="qq-bubble-title">' +
+          inlineMarkdown(line.slice(3)) +
+          "</div>"
+        );
+      }
+      return '<div class="qq-line">' + inlineMarkdown(line) + "</div>";
+    })
+    .join("");
+}
+
+function renderMarkdownBubble(preview) {
+  const markdown = (preview && preview.markdown) || {};
+  const body = markdown.text
+    ? renderMarkdownLines(markdown.text)
+    : '<div class="qq-note">当前排版不是 Markdown，这条消息会按普通消息发送。</div>';
+  const bubble = '<div class="qq-bubble">' + body + "</div>";
+  return renderMessageFrame(preview, bubble);
+}
+
 function renderForwardBubble(preview) {
   const forward = (preview && preview.forward) || {};
   const nodes = [];
@@ -955,8 +1205,48 @@ function renderForwardBubble(preview) {
   return renderMessageFrame(preview, card);
 }
 
+function effectivePane(preview) {
+  const style = (preview && preview.style) || "plain";
+  const forwardEnabled = !!(preview && preview.forward_enabled);
+  return {
+    style: style,
+    forwardEnabled: forwardEnabled,
+    title:
+      style === "markdown"
+        ? "Markdown（QQ 官方机器人）"
+        : forwardEnabled
+          ? "合并转发"
+          : "普通消息",
+  };
+}
+
+function renderFakeKeyboard(urgent) {
+  const details = (urgent.detail_buttons || []).filter(Boolean);
+  const ack = urgent.ack_label || "";
+  if (!details.length && !ack) return "";
+  const rows = [];
+  if (details.length) {
+    rows.push(
+      '<div class="qq-key-row">' +
+        details
+          .map((label) => '<span class="qq-key">' + escapeHtml(label) + "</span>")
+          .join("") +
+        "</div>",
+    );
+  }
+  if (ack) {
+    rows.push(
+      '<div class="qq-key-row">' +
+        '<span class="qq-key qq-key-primary">' + escapeHtml(ack) + "</span>" +
+        "</div>",
+    );
+  }
+  return '<div class="qq-keyboard">' + rows.join("") + "</div>";
+}
+
 function renderUrgentPreview(preview, urgent) {
   if (!urgent || !urgent.nodes || !urgent.nodes.length) return "";
+  const pane = effectivePane(preview);
   const sender = (preview && preview.sender) || {};
   const lines = (urgent.plain_lines || [])
     .map((line) => '<div class="qq-line">' + escapeHtml(line) + "</div>")
@@ -974,6 +1264,25 @@ function renderUrgentPreview(preview, urgent) {
       footer: "查看" + urgent.nodes.length + "条转发消息",
     },
   });
+  const markdownLines = urgent.markdown_lines || [];
+  const summaryLines = urgent.summary_lines || [];
+  // 活动够多时线上发的是「摘要 + 看详情按钮」，Markdown 栏就照这个样子画
+  const bodyLines = summaryLines.length ? summaryLines : markdownLines;
+  const markdown = renderMessageFrame(
+    preview,
+    '<div class="qq-bubble">' +
+      (bodyLines.length
+        ? renderMarkdownLines(bodyLines.join("\n"))
+        : '<div class="qq-note">当前排版不是 Markdown，这条提醒会按普通消息发送。</div>') +
+      renderFakeKeyboard(urgent) +
+      "</div>",
+  );
+  const body =
+    pane.style === "markdown"
+      ? markdown
+      : pane.forwardEnabled
+        ? forward
+        : plain;
   return [
     '<section class="tmpl-urgent">',
     '  <div class="tmpl-urgent-head">',
@@ -984,12 +1293,8 @@ function renderUrgentPreview(preview, urgent) {
     "  </div>",
     '  <div class="tmpl-urgent-panes">',
     '    <div class="tmpl-pane">',
-    '      <div class="tmpl-pane-title">普通消息</div>',
-    plain,
-    "    </div>",
-    '    <div class="tmpl-pane">',
-    '      <div class="tmpl-pane-title">合并转发</div>',
-    forward,
+    '      <div class="tmpl-pane-title">' + escapeHtml(pane.title) + "</div>",
+    body,
     "    </div>",
     "  </div>",
     "</section>",
@@ -1035,14 +1340,17 @@ templateState.elements.preview.addEventListener("click", (event) => {
 });
 
 function renderTemplatePreview(preview) {
+  const pane = effectivePane(preview);
+  const body =
+    pane.style === "markdown"
+      ? renderMarkdownBubble(preview)
+      : pane.forwardEnabled
+        ? renderForwardBubble(preview)
+        : renderPlainBubble(preview);
   templateState.elements.preview.innerHTML = [
     '<div class="tmpl-pane">',
-    '  <div class="tmpl-pane-title">普通消息</div>',
-    renderPlainBubble(preview),
-    "</div>",
-    '<div class="tmpl-pane">',
-    '  <div class="tmpl-pane-title">合并转发</div>',
-    renderForwardBubble(preview),
+    '  <div class="tmpl-pane-title">' + escapeHtml(pane.title) + "</div>",
+    body,
     "</div>",
     renderUrgentPreview(preview, preview && preview.urgent),
     '<button class="tmpl-scroll-hint" id="tmpl-scroll-hint" type="button">',
@@ -1051,6 +1359,7 @@ function renderTemplatePreview(preview) {
     "</button>",
   ].join("");
   updateTemplateScrollHint();
+  renderHeadExtra();
 }
 
 function applyTemplateValues(values) {
@@ -1076,6 +1385,13 @@ async function openTemplate() {
     templateState.games = (data && data.games) || [];
     templateState.coverModes =
       (data && data.cover_modes) || ["image", "link", "off"];
+    templateState.platforms = (data && data.preview_platforms) || [];
+    const savedPlatform = loadPreviewPlatform();
+    templateState.previewPlatform = previewPlatformChoices().includes(savedPlatform)
+      ? savedPlatform
+      : "auto";
+    templateState.certification =
+      (data && data.certification) || "unknown";
     templateState.gameId = "";
     renderTemplateControls();
     await refreshTemplatePreview();
@@ -1088,11 +1404,32 @@ function closeTemplate() {
   templateState.elements.modal.classList.add("is-hidden");
 }
 
-function resetTemplate() {
+async function resetTemplate() {
   if (!templateState.initial) return;
+  // 排版方式是改下拉就立刻存盘的，所以「还原」也得把它一起存回去，
+  // 不然界面退回去了、配置还是新的，下次打开又变回来。
+  const previousMode =
+    (templateState.values && templateState.values.markdown_mode) || "auto";
+  const initialMode = templateState.initial.markdown_mode || "auto";
   applyTemplateValues(templateState.initial);
   refreshTemplatePreview();
-  showToast("已还原为保存前的设置");
+  if (previousMode === initialMode || !bridge) {
+    showToast("已还原为保存前的设置");
+    return;
+  }
+  try {
+    await bridge.apiPost("markdown-mode-save", { markdown_mode: initialMode });
+    setTemplateNote(
+      "已还原为保存前的设置（排版方式也退回" +
+        (MARKDOWN_LABELS[initialMode] || initialMode) +
+        "）",
+    );
+  } catch (error) {
+    showToast(
+      error && error.message ? error.message : "排版方式还原失败",
+      true,
+    );
+  }
 }
 
 async function saveTemplate() {
@@ -1118,9 +1455,8 @@ templateState.elements.button.addEventListener("click", openTemplate);
 templateState.elements.close.addEventListener("click", closeTemplate);
 templateState.elements.reset.addEventListener("click", resetTemplate);
 templateState.elements.save.addEventListener("click", saveTemplate);
-templateState.elements.modal.addEventListener("click", (event) => {
-  if (event.target === templateState.elements.modal) closeTemplate();
-});
+// 点遮罩不关窗：拖选文字划到空白处松手也算一次 click，很容易选到一半就把窗口关了。
+// 要关就点右上角 ×。
 
 // ---- 数据源与代理设置 ----
 
@@ -1328,9 +1664,7 @@ settingsState.elements.button.addEventListener("click", openSettings);
 settingsState.elements.close.addEventListener("click", closeSettings);
 settingsState.elements.reset.addEventListener("click", resetSettings);
 settingsState.elements.save.addEventListener("click", saveSettings);
-settingsState.elements.modal.addEventListener("click", (event) => {
-  if (event.target === settingsState.elements.modal) closeSettings();
-});
+// 同上：点遮罩不关窗，只认右上角 ×。
 
 
 // ---- 紧急私聊提醒 ----
@@ -1682,9 +2016,7 @@ urgentState.elements.button.addEventListener("click", openUrgent);
 urgentState.elements.close.addEventListener("click", closeUrgent);
 urgentState.elements.reload.addEventListener("click", loadUrgent);
 urgentState.elements.add.addEventListener("click", addUrgentTarget);
-urgentState.elements.modal.addEventListener("click", (event) => {
-  if (event.target === urgentState.elements.modal) closeUrgent();
-});
+// 同上：点遮罩不关窗，只认右上角 ×。
 
 elements.refreshButton.addEventListener("click", () =>
   loadOverview({ announce: true }),

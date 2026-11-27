@@ -13,12 +13,18 @@ from astrbot.api import logger
 
 from ..sources.base import Activity, GAME_TIMEZONE, Game, filter_relevant
 from ..sources.registry import GameRegistry
-from .delivery_service import ActivityDeliveryService
+from .delivery_service import (
+    DETAIL_ALL,
+    DETAIL_ALL_LABEL,
+    DETAIL_MAX_BUTTONS,
+    ActivityDeliveryService,
+)
 from .message_formatter import (
     MessageSettings,
     build_overview_parts,
     build_urgent_dm_groups,
     build_urgent_dm_parts,
+    build_urgent_dm_summary_parts,
     build_urgent_dm_title,
     build_overview_title,
     short_game_name,
@@ -352,7 +358,13 @@ class ActivityPollingService:
         return needed
 
     @staticmethod
-    def _urgent_ack_hint() -> str:
+    def _urgent_ack_hint(with_button: bool = False, summary: bool = False) -> str:
+        # 挂着按钮时就别再教人打字回 /我已知晓 了：按钮上写得清清楚楚，
+        # Markdown 下还白白多占一行。
+        if summary:
+            return "（点下面的游戏按钮看详细；点「我已知晓」就停掉这轮）"
+        if with_button:
+            return "（点下面的「我已知晓」就停掉这轮）"
         return "（回一句「/我已知晓」就不会再催你了）"
 
     async def _deliver_urgent_dm(
@@ -397,9 +409,47 @@ class ActivityPollingService:
                 self.message_settings,
                 games=self.registry.games,
             )
-            ack_hint = self._urgent_ack_hint()
+            # QQ 官方机器人支持 inline keyboard：提醒末尾挂「我已知晓」按钮，
+            # 点一次就完成确认（AstrBot 在分发事件前已经 ack 掉 interaction）。
+            with_button = bool(
+                base_settings.ack_button and self.delivery.supports_button(umo)
+            )
+            # 同时结束的活动一多，整条详情很容易被划过去；官方机器人又没有合并
+            # 转发可用，所以改成「摘要 + 看详情按钮」，详情点一下再发。
+            use_summary = bool(
+                with_button
+                and base_settings.detail_button
+                and len(pending) >= max(2, int(base_settings.detail_min))
+            )
+            ack_hint = self._urgent_ack_hint(with_button, summary=use_summary)
+            style = self.delivery.message_style(umo, self.message_settings)
             sent = False
-            if self.message_settings.use_forward_node:
+            if use_summary:
+                parts = build_urgent_dm_summary_parts(
+                    pending,
+                    now,
+                    self.message_settings,
+                    games=self.registry.games,
+                    ack_hint=ack_hint,
+                    style=style,
+                )
+                entries = [
+                    (group.short, {"detail": group.game_id})
+                    for group in groups[:DETAIL_MAX_BUTTONS]
+                ]
+                detail_rows = self.delivery.build_detail_rows(
+                    entries,
+                    all_entry=(DETAIL_ALL_LABEL, {"detail": DETAIL_ALL}),
+                )
+                sent = await self.delivery.send_parts(
+                    umo,
+                    parts,
+                    replace(self.message_settings, use_forward_node=False),
+                    node_name=self.message_settings.forward_node_name,
+                    ack_button=with_button,
+                    extra_rows=detail_rows,
+                )
+            if not sent and self.message_settings.use_forward_node:
                 sent = await self.delivery.send_urgent_forward(
                     umo,
                     groups,
@@ -415,12 +465,14 @@ class ActivityPollingService:
                     self.message_settings,
                     ack_hint=ack_hint,
                     games=self.registry.games,
+                    style=style,
                 )
                 sent = await self.delivery.send_parts(
                     umo,
                     parts,
                     replace(self.message_settings, use_forward_node=False),
                     node_name=self.message_settings.forward_node_name,
+                    ack_button=with_button,
                 )
             if not sent:
                 continue
@@ -478,6 +530,7 @@ class ActivityPollingService:
                 now,
                 settings,
                 source_name=self.registry.source_name(game.game_id),
+                style=self.delivery.message_style(umo, settings),
             )
             if await self.delivery.send_parts(
                 umo,

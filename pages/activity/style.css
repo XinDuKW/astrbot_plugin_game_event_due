@@ -585,6 +585,17 @@ select:disabled {
   text-transform: uppercase;
 }
 
+/* 强制 Markdown 时合并转发相关的控件被藏起来，这里说明一句 */
+.tmpl-forced-note {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px dashed var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-muted);
+}
+
 .tmpl-toggle {
   align-items: flex-start;
 }
@@ -627,7 +638,7 @@ select:disabled {
   overflow-y: auto;
   background: var(--panel-alt);
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   gap: 16px;
   align-content: start;
 }
@@ -668,7 +679,7 @@ select:disabled {
 
 .tmpl-urgent-panes {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
   gap: 16px;
 }
 
@@ -749,6 +760,13 @@ select:disabled {
   min-height: 6px;
 }
 
+.qq-line a,
+.qq-bubble-title a {
+  color: var(--accent, #4f8cff);
+  text-decoration: none;
+  word-break: break-all;
+}
+
 .qq-separator {
   margin: 8px 0;
   color: var(--text-muted);
@@ -762,6 +780,39 @@ select:disabled {
   margin-top: 6px;
   font-size: 12px;
   color: var(--text-muted);
+}
+
+/* 模拟 QQ 官方的 inline keyboard：一行行等宽按钮，主按钮蓝色 */
+.qq-keyboard {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.qq-key-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.qq-key {
+  flex: 1 1 0;
+  min-width: 56px;
+  padding: 5px 8px;
+  border-radius: 6px;
+  background: #3a3b40;
+  color: #e8e8ea;
+  font-size: 12px;
+  text-align: center;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.qq-key-primary {
+  background: #0a84ff;
+  color: #fff;
 }
 
 .qq-cover {
@@ -1060,4 +1111,48 @@ select:disabled {
   .urgent-fields {
     grid-template-columns: 1fr;
   }
+}
+
+.modal-head-extra {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.modal-head-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  max-width: 190px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modal-head-select {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.modal-head-select select {
+  padding: 4px 8px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--surface-strong, rgba(255, 255, 255, 0.06));
+  color: inherit;
+  font-size: 12px;
+  max-width: 240px;
+}
+
+.qq-md-image {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 6px 0;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.04);
 }

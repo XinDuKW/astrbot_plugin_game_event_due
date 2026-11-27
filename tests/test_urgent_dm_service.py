@@ -5,10 +5,14 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 
 from astrbot_plugin_game_event_due.services.urgent_dm_service import (
+    CERTIFICATION_ENTERPRISE,
+    CERTIFICATION_PERSONAL,
+    CERTIFICATION_UNKNOWN,
     DEFAULT_ACK_KEYWORDS,
     DEFAULT_QUIET_HOURS,
     UrgentDmSettings,
     UrgentTargetState,
+    certification_tip,
     describe_target_settings,
     in_quiet_hours,
     is_ack_text,
@@ -16,10 +20,13 @@ from astrbot_plugin_game_event_due.services.urgent_dm_service import (
     mark_sent,
     mentions_activity,
     normalize_ack_keywords,
+    normalize_certification,
     normalize_games,
     normalize_targets,
+    parse_certification,
     parse_quiet_hours,
     parse_target_settings,
+    private_dm_blocked_hint,
     should_notify_now,
     target_settings,
     urgent_activities,
@@ -532,3 +539,57 @@ def test_normalize_urgent_dm_keeps_target_settings():
     }
     data = SubscriptionService._normalize_urgent_dm(raw)
     assert data["umo-1"]["settings"] == {"trigger_days": 7}
+
+
+def test_parse_certification_accepts_aliases():
+    for raw in ("personal", "个人认证", "个人", "个体", "PERSONAL"):
+        assert parse_certification(raw) == CERTIFICATION_PERSONAL
+    for raw in ("enterprise", "企业认证", "企业", "company"):
+        assert parse_certification(raw) == CERTIFICATION_ENTERPRISE
+    for raw in ("unknown", "不确定", "未知", "", None, "auto"):
+        assert parse_certification(raw) == CERTIFICATION_UNKNOWN
+    assert parse_certification("小米") is None
+
+
+def test_normalize_certification_falls_back_to_unknown():
+    assert normalize_certification("企业认证") == CERTIFICATION_ENTERPRISE
+    assert normalize_certification("nope") == CERTIFICATION_UNKNOWN
+    assert normalize_certification(None) == CERTIFICATION_UNKNOWN
+
+
+def test_private_dm_blocked_hint_personal_mentions_dev_users():
+    text = private_dm_blocked_hint(CERTIFICATION_PERSONAL, code="123456")
+    assert "个人认证" in text
+    assert "开发体验号码设置" in text
+    assert "体验成员" in text
+    assert "20" in text
+    assert "/活动私人提醒 绑定 123456" in text
+    assert "15 分钟内有效" in text
+
+
+def test_private_dm_blocked_hint_enterprise_skips_dev_users():
+    text = private_dm_blocked_hint(CERTIFICATION_ENTERPRISE)
+    assert "企业认证" in text
+    assert "开发体验号码设置" not in text
+    assert "/活动私人提醒 绑定" not in text
+
+
+def test_private_dm_blocked_hint_unknown_covers_both():
+    text = private_dm_blocked_hint(CERTIFICATION_UNKNOWN, code="654321")
+    assert "个人认证" in text
+    assert "企业认证" in text
+    assert "/活动私人提醒 绑定 654321" in text
+
+
+def test_private_dm_blocked_hint_respects_ttl():
+    text = private_dm_blocked_hint(
+        CERTIFICATION_PERSONAL, code="111111", ttl_minutes=0
+    )
+    assert "1 分钟内有效" in text
+
+
+def test_certification_tip_only_for_known_kinds():
+    assert "开发体验号码设置" in certification_tip(CERTIFICATION_PERSONAL)
+    assert "企业认证" in certification_tip(CERTIFICATION_ENTERPRISE)
+    assert certification_tip(CERTIFICATION_UNKNOWN) == ""
+    assert certification_tip("whatever") == ""

@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import secrets
 from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any
@@ -37,6 +38,10 @@ from .urgent_dm_service import (
 SUBSCRIPTIONS_KEY = "game_event_due_subscriptions_v1"
 NOTIFY_STATE_KEY = "game_event_due_notify_state_v1"
 URGENT_DM_KEY = "game_event_due_urgent_dm_v1"
+BIND_CODE_KEY = "game_event_due_bind_code_v1"
+
+BIND_CODE_TTL_MINUTES = 15
+MAX_BIND_CODES = 50
 
 MAX_GAMES_PER_SESSION = 32
 MAX_KEYWORDS = 50
@@ -650,6 +655,89 @@ class SubscriptionService:
     ) -> None:
         data.pop(umo, None)
 
+    # ---- 群内私聊绑定码 ----
+
+    async def get_bind_codes(self) -> dict[str, dict[str, Any]]:
+        raw = await self._get_kv(BIND_CODE_KEY, {})
+        return self._normalize_bind_codes(raw)
+
+    @staticmethod
+    def _normalize_bind_codes(raw: Any) -> dict[str, dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return {}
+        codes = raw.get("codes")
+        if not isinstance(codes, dict):
+            return {}
+        result: dict[str, dict[str, Any]] = {}
+        for code, entry in codes.items():
+            key = str(code or "").strip()
+            if not key or not isinstance(entry, dict):
+                continue
+            result[key] = {
+                "source": str(entry.get("source") or ""),
+                "sender": str(entry.get("sender") or ""),
+                "created": str(entry.get("created") or ""),
+                "expires": str(entry.get("expires") or ""),
+                "used": bool(entry.get("used", False)),
+            }
+        return result
+
+    async def save_bind_codes(self, data: dict[str, dict[str, Any]]) -> None:
+        async with self._lock:
+            await self._put_kv(
+                BIND_CODE_KEY,
+                {"codes": {code: entry for code, entry in data.items() if entry}},
+            )
+
+    @staticmethod
+    def create_bind_code(
+        data: dict[str, dict[str, Any]],
+        *,
+        source: str,
+        sender: str,
+        now: datetime,
+        ttl_minutes: int = BIND_CODE_TTL_MINUTES,
+    ) -> str:
+        """生成一次性绑定码（6 位数字），顺手清掉过期与已用的旧码。"""
+        for code in list(data.keys()):
+            entry = data.get(code) or {}
+            expires = parse_datetime(entry.get("expires"))
+            if entry.get("used") or (expires is not None and expires <= now):
+                data.pop(code, None)
+        while len(data) >= MAX_BIND_CODES:
+            data.pop(next(iter(data)), None)
+
+        code = ""
+        while not code or code in data:
+            code = f"{secrets.randbelow(900000) + 100000:06d}"
+        minutes = max(1, int(ttl_minutes))
+        data[code] = {
+            "source": source,
+            "sender": sender,
+            "created": now.isoformat(),
+            "expires": (now + timedelta(minutes=minutes)).isoformat(),
+            "used": False,
+        }
+        return code
+
+    @staticmethod
+    def consume_bind_code(
+        data: dict[str, dict[str, Any]],
+        code: str,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        """取出并作废一个绑定码；不存在、已用或过期都返回 None。"""
+        key = str(code or "").strip()
+        entry = data.get(key)
+        if not isinstance(entry, dict):
+            return None
+        expires = parse_datetime(entry.get("expires"))
+        if entry.get("used") or (expires is not None and expires <= now):
+            data.pop(key, None)
+            return None
+        entry["used"] = True
+        return dict(entry)
+
     # ---- 紧急私聊提醒的目标与状态 ----
 
     async def get_urgent_dm(self) -> dict[str, dict[str, Any]]:
@@ -843,6 +931,41 @@ class SubscriptionService:
             bucket[uid] = payload
             acked.append(name or uid)
         return acked
+
+    @staticmethod
+    def latest_batch(
+        data: dict[str, dict[str, Any]],
+        umo: str,
+    ) -> dict[str, dict[str, Any]]:
+        """取「最近一轮被催的那批」活动：uid → 状态记录。
+
+        同一轮里被催的活动共用同一个 ``last_sent_at``，所以按它的最大值取一批；
+        已经确认过的、从没被催过的都不算。摘要消息的「看详情」按钮靠它定位内容。
+        """
+        entry = data.get(umo)
+        bucket = entry.get("activities") if isinstance(entry, dict) else None
+        if not isinstance(bucket, dict):
+            return {}
+        latest = ""
+        for raw in bucket.values():
+            if not isinstance(raw, dict):
+                continue
+            state = UrgentTargetState.from_dict(raw)
+            if state.acked or not state.last_sent_at:
+                continue
+            if state.last_sent_at > latest:
+                latest = state.last_sent_at
+        if not latest:
+            return {}
+        batch: dict[str, dict[str, Any]] = {}
+        for uid, raw in bucket.items():
+            if not isinstance(raw, dict):
+                continue
+            state = UrgentTargetState.from_dict(raw)
+            if state.acked or state.last_sent_at != latest:
+                continue
+            batch[uid] = raw
+        return batch
 
     @staticmethod
     def ack_latest_batch(

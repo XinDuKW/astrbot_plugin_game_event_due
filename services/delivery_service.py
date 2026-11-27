@@ -23,6 +23,10 @@ import astrbot.api.message_components as Comp
 from ..sources.base import Game
 from .cover_service import CoverResolver, select_within_budget
 from .message_formatter import (
+    MARKDOWN_MODE_OFF,
+    MARKDOWN_MODE_ON,
+    STYLE_MARKDOWN,
+    STYLE_PLAIN,
     MessagePart,
     MessageSettings,
     UrgentGroup,
@@ -30,6 +34,7 @@ from .message_formatter import (
     build_overview_blocks,
     build_reminder_parts,
     build_single_reminder_parts,
+    normalize_markdown_mode,
     short_game_name,
     sort_plans_by_urgency,
     fit_forward_title,
@@ -43,6 +48,46 @@ NODE_NAME = "游戏活动日历"
 # QQ 官方机器人适配器会忽略 Node/Nodes 组件，整条消息变空后被直接丢弃，
 # 所以必须按平台判断，不能靠发送异常兜底。
 FORWARD_PLATFORMS = frozenset({"aiocqhttp"})
+
+# 这些平台的适配器默认把纯文本塞进 msg_type=2 的 markdown 内容里发送
+# （AstrBot 的 use_markdown 默认就是开），所以带 markdown 语法的文本会被
+# 渲染成排版而不是原样显示。它们同时**不支持**合并转发。
+MARKDOWN_PLATFORMS = frozenset({"qq_official", "qq_official_webhook"})
+
+# 只有这几个平台会把 ActionRow 渲染成真正的可点按钮（QQ 官方机器人的
+# inline keyboard）。onebot 系能不能显示取决于协议端实现，不能保证，
+# 所以宁可不发——点不了的按钮比没有按钮更糟。
+BUTTON_PLATFORMS = frozenset({"qq_official", "qq_official_webhook"})
+
+# 按钮的 action id：事件回到插件时靠它认领。改这个值必须同步 main.py。
+ACK_BUTTON_ID = "game_event_ack"
+ACK_BUTTON_LABEL = "我已知晓"
+# 二次确认按钮：点「我已知晓」后插件再发一条带这个按钮的消息，按下它才真的停止提醒。
+# QQ 官方没有「更新已发消息里的按钮」接口，所以没法原地把第一个按钮改成确认按钮。
+ACK_CONFIRM_BUTTON_ID = "game_event_ack_confirm"
+ACK_CONFIRM_BUTTON_LABEL = "确认不再提醒"
+# 二次确认消息里的另一半：反悔按钮。它不动提醒状态，只是让「待确认」这一步作废，
+# 下一轮该催还催——防止误点「我已知晓」后只能靠再点一次确认来纠正。
+ACK_CANCEL_BUTTON_ID = "game_event_ack_cancel"
+ACK_CANCEL_BUTTON_LABEL = "取消确认"
+# 测试按钮的回调上下文：插件收到它就知道这是一次通路测试，不去动真的提醒状态。
+ACK_BUTTON_TEST_DATA = {"test": "ack"}
+
+# 摘要消息底下的「看详情」按钮：所有游戏共用这一个 action id（ButtonActionFilter
+# 只按 id 精确匹配，没法给每款游戏单独建一个），具体游戏放在回调 data 里。
+DETAIL_BUTTON_ID = "game_event_detail"
+DETAIL_ALL = "*"
+DETAIL_ALL_LABEL = "全部"
+# QQ inline keyboard 的 label 上限，超了会被平台截断，干脆自己先截。
+DETAIL_LABEL_MAX = 10
+# QQ inline keyboard 的布局上限是 5 行 × 每行 5 个；游戏多了就换行，
+# 不再挤在一行里（挤在一行时按钮字会被截到看不出是哪款游戏）。
+DETAIL_BUTTONS_PER_ROW = 5
+DETAIL_ROWS_MAX = 5
+# 一共最多几个游戏按钮：留一格给最后的「全部」。
+DETAIL_MAX_BUTTONS = DETAIL_BUTTONS_PER_ROW * DETAIL_ROWS_MAX - 1
+# 旧名字，早期是「一行 4 个游戏 + 全部」；现在表示按钮总数上限，调用方仍在用。
+DETAIL_ROW_LIMIT = DETAIL_MAX_BUTTONS
 
 SEND_TEXT = "text"
 SEND_IMAGE = "image"
@@ -77,15 +122,222 @@ class ActivityDeliveryService:
 
     # ---- 平台能力 ----
 
-    @staticmethod
-    def supports_forward(umo: str) -> bool:
+    def platform_type(self, umo: str) -> str:
+        """把这个会话的平台类型名取出来（aiocqhttp / qq_official / …）。
+
+        UMO 的第一段是**平台 id**，也就是用户在 AstrBot 配置里给适配器起的名字
+        （Fairy、Ponderer、MengDuYW 之类），和适配器类型没有任何关系；拿它跟
+        "qq_official" 这种类型名比较，只要用户改过 id 就永远不匹配。所以这里先
+        用平台管理器按 id 反查类型，查不到时才退回按原样比较。
+        """
+        raw = umo.split(":", 1)[0].strip() if umo else ""
+        if not raw:
+            return ""
+        return (self._lookup_platform_type(raw) or raw).casefold()
+
+    def _lookup_platform_type(self, platform_id: str) -> str:
+        """按平台 id 找适配器类型；拿不到就返回空串，由调用方退回原样比较。"""
+        manager = getattr(self.context, "platform_manager", None)
+        getter = getattr(manager, "get_insts", None)
+        if not callable(getter):
+            return ""
+        try:
+            insts = getter()
+        except Exception as exc:  # pragma: no cover - 取决于 AstrBot 版本
+            logger.debug(f"读取平台实例失败，按 UMO 前缀判断: {exc}")
+            return ""
+        target = platform_id.strip().casefold()
+        for inst in insts or []:
+            meta_getter = getattr(inst, "meta", None)
+            try:
+                meta = meta_getter() if callable(meta_getter) else None
+            except Exception:  # pragma: no cover - 单个适配器自身报错
+                meta = None
+            if meta is None:
+                continue
+            if str(getattr(meta, "id", "")).strip().casefold() != target:
+                continue
+            name = str(getattr(meta, "name", "") or "").strip()
+            if name:
+                return name
+        return ""
+
+    def supports_forward(self, umo: str) -> bool:
         """当前会话所在平台是否支持合并转发。
 
         QQ 官方机器人（qq_official）会忽略 Node/Nodes 且不抛异常，直接丢掉整条
         消息，所以这里必须先看平台；其它平台一律走普通消息。
         """
-        prefix = umo.split(":", 1)[0].strip().casefold() if umo else ""
-        return prefix in FORWARD_PLATFORMS
+        return self.platform_type(umo) in FORWARD_PLATFORMS
+
+    def supports_markdown(self, umo: str) -> bool:
+        """当前会话所在平台是否会把纯文本当 markdown 渲染。
+
+        QQ 官方机器人（qq_official / qq_official_webhook）默认就是这样；onebot
+        系发什么都原样显示，塞 markdown 语法只会露出星号，所以不宣称支持。
+        """
+        return self.platform_type(umo) in MARKDOWN_PLATFORMS
+
+    def supports_button(self, umo: str) -> bool:
+        """当前平台能不能画出可点击的「我已知晓」按钮。"""
+        return self.platform_type(umo) in BUTTON_PLATFORMS
+
+    @staticmethod
+    def build_ack_row(data: Any = None, *, confirm: bool = False) -> Any | None:
+        """构造「我已知晓」按钮行；组件缺失时返回 None。
+
+        QQ 一次点击就会回调（AstrBot 在分发事件前已经 ack 掉 interaction），所以
+        不会卡 loading。confirm=True 时同一行里放两个按钮：红色「确认不再提醒」
+        和一个灰色「取消确认」，二次确认时既可以确认也能反悔。data 是随点击一起
+        回传的回调上下文，测试指令靠它区分「测试按钮」和真正的提醒按钮。
+        """
+        button_class = getattr(Comp, "Button", None)
+        row_class = getattr(Comp, "ActionRow", None)
+        if not (button_class and row_class):
+            return None
+        try:
+            if confirm:
+                buttons = [
+                    button_class(
+                        id=ACK_CONFIRM_BUTTON_ID,
+                        label=ACK_CONFIRM_BUTTON_LABEL,
+                        style=button_class.Style.DANGER,
+                        action=button_class.CallbackAction(data=data),
+                    ),
+                    button_class(
+                        id=ACK_CANCEL_BUTTON_ID,
+                        label=ACK_CANCEL_BUTTON_LABEL,
+                        style=button_class.Style.DEFAULT,
+                        action=button_class.CallbackAction(data=data),
+                    ),
+                ]
+            else:
+                buttons = [
+                    button_class(
+                        id=ACK_BUTTON_ID,
+                        label=ACK_BUTTON_LABEL,
+                        style=button_class.Style.PRIMARY,
+                        action=button_class.CallbackAction(data=data),
+                    )
+                ]
+            return row_class(buttons=buttons)
+        except Exception as exc:  # pragma: no cover - 取决于 AstrBot 版本
+            logger.warning(f"构造「我已知晓」按钮失败，本条提醒不带按钮: {exc}")
+            return None
+
+    @staticmethod
+    def build_detail_row(
+        entries: Sequence[tuple[str, Any]],
+    ) -> Any | None:
+        """构造「看详情」按钮行：entries 是 (按钮文字, 回调数据) 列表。
+
+        组件缺失（旧版 AstrBot）时返回 None，调用方按「没有按钮」降级。
+        """
+        button_class = getattr(Comp, "Button", None)
+        row_class = getattr(Comp, "ActionRow", None)
+        if not (button_class and row_class) or not entries:
+            return None
+        buttons = []
+        try:
+            for index, (label, data) in enumerate(entries):
+                # QQ 官方适配器要求同一份 keyboard 里按钮 id 唯一
+                # （_parse_keyboard 里重复 id 直接抛 ValueError，整条消息发不出去），
+                # 所以 id 是「固定前缀 + 序号」；处理器用 action_id=None 接住全部点击，
+                # 再靠回调数据里的 detail 字段区分点的是哪个游戏。
+                buttons.append(
+                    button_class(
+                        id=f"{DETAIL_BUTTON_ID}_{index}",
+                        label=str(label)[:DETAIL_LABEL_MAX] or "详情",
+                        style=button_class.Style.DEFAULT,
+                        action=button_class.CallbackAction(data=data),
+                    )
+                )
+            return row_class(buttons=buttons)
+        except Exception as exc:  # pragma: no cover - 取决于 AstrBot 版本
+            logger.warning(f"构造「看详情」按钮失败，本条提醒不带按钮: {exc}")
+            return None
+
+    @classmethod
+    def build_detail_rows(
+        cls,
+        entries: Sequence[tuple[str, Any]],
+        *,
+        all_entry: tuple[str, Any] | None = None,
+    ) -> list[Any]:
+        """构造「看详情」按钮，按每行 5 个排成多行（QQ 上限 5 行 × 5 个）。
+
+        entries 是 (按钮文字, 回调数据)，按传入顺序排（调用方按紧急程度排好）；
+        all_entry 是压在最后的「全部」按钮，用 PRIMARY 样式好认。
+        组件缺失（旧版 AstrBot）时返回空列表，调用方按「没有按钮」降级。
+        """
+        button_class = getattr(Comp, "Button", None)
+        row_class = getattr(Comp, "ActionRow", None)
+        if not (button_class and row_class) or not entries:
+            return []
+        flat: list[tuple[str, Any, bool]] = [
+            (str(label), data, False) for label, data in entries[:DETAIL_MAX_BUTTONS]
+        ]
+        if all_entry is not None:
+            flat.append((str(all_entry[0]), all_entry[1], True))
+        rows: list[Any] = []
+        try:
+            for start in range(0, len(flat), DETAIL_BUTTONS_PER_ROW):
+                chunk = flat[start : start + DETAIL_BUTTONS_PER_ROW]
+                buttons = []
+                for index, (label, data, primary) in enumerate(chunk, start=start):
+                    # id 必须全局唯一（适配器会校验重复 id），所以用整体序号。
+                    buttons.append(
+                        button_class(
+                            id=f"{DETAIL_BUTTON_ID}_{index}",
+                            label=label[:DETAIL_LABEL_MAX] or "详情",
+                            style=(
+                                button_class.Style.PRIMARY
+                                if primary
+                                else button_class.Style.DEFAULT
+                            ),
+                            action=button_class.CallbackAction(data=data),
+                        )
+                    )
+                rows.append(row_class(buttons=buttons))
+            return rows
+        except Exception as exc:  # pragma: no cover - 取决于 AstrBot 版本
+            logger.warning(f"构造「看详情」按钮失败，本条提醒不带按钮: {exc}")
+            return []
+
+    def message_style(
+        self,
+        umo: str,
+        settings: MessageSettings | None = None,
+    ) -> str:
+        """这条消息该用哪种排版：``plain`` 还是 ``markdown``。
+
+        ``markdown_mode`` 为 ``on`` 时强制 markdown（哪怕平台不认，用户自己选的），
+        ``off`` 时始终纯文本；``auto`` 按平台判断。markdown 与合并转发互斥，
+        markdown 生效时调用方不应再走转发分支。
+        """
+        effective = settings or self.settings
+        mode = normalize_markdown_mode(getattr(effective, "markdown_mode", None))
+        if mode == MARKDOWN_MODE_OFF:
+            return STYLE_PLAIN
+        if mode == MARKDOWN_MODE_ON:
+            return STYLE_MARKDOWN
+        return (
+            STYLE_MARKDOWN if self.supports_markdown(umo) else STYLE_PLAIN
+        )
+
+    def _can_forward(
+        self,
+        umo: str,
+        settings: MessageSettings | None = None,
+    ) -> bool:
+        """平台支持转发、且这条消息不是 markdown 排版时才走转发。
+
+        markdown 是「一条消息里排版」，合并转发是「多条消息折叠成一条」，两者混在
+        一起会把语法塞进节点里露出原始星号，所以 markdown 生效时一律不转发。
+        """
+        return self.supports_forward(umo) and (
+            self.message_style(umo, settings) == STYLE_PLAIN
+        )
 
     # ---- 片段 → 发送项 ----
 
@@ -283,7 +535,7 @@ class ActivityDeliveryService:
         """
         if not groups:
             return True
-        if not self.supports_forward(umo):
+        if not self._can_forward(umo, settings):
             return False
         node_name = node_name or settings.forward_node_name or NODE_NAME
         head, _, summary = title.partition("\n")
@@ -324,7 +576,7 @@ class ActivityDeliveryService:
         节点名统一用游戏简称，点开后逐条都是完整活动（含封面）。平台不支持
         合并转发时返回 None，由调用方回退普通消息。
         """
-        if not self.supports_forward(umo):
+        if not self._can_forward(umo, settings):
             return None
         header, blocks = build_overview_blocks(
             game, activities, now, settings, source_name=source_name
@@ -355,7 +607,7 @@ class ActivityDeliveryService:
         """
         effective = settings or self.settings
         chain = self.build_chain(await self.resolve_parts(parts, effective))
-        if effective.use_forward_node and self.supports_forward(umo):
+        if effective.use_forward_node and self._can_forward(umo, effective):
             nodes = [self._plain_chain(forward_title), chain]
             forward = self.build_forward_chain(nodes, node_name)
             if forward is not None:
@@ -396,13 +648,15 @@ class ActivityDeliveryService:
         umo: str,
         node_chains: Sequence[Sequence[Any]],
         node_name: str,
+        settings: MessageSettings | None = None,
     ) -> bool:
         """把若干节点内容合并成一条转发消息发送。
 
         一个游戏只发一条转发消息，游戏内的每个活动各自成为一个节点。返回
-        False 表示当前环境不支持或发送失败，调用方应回退为普通消息。
+        False 表示当前环境不支持、正在用 markdown 排版或发送失败，调用方应
+        回退为普通消息。
         """
-        if not self.supports_forward(umo):
+        if not self._can_forward(umo, settings):
             return False
         chain = self.build_forward_chain(node_chains, node_name)
         if chain is None:
@@ -428,9 +682,11 @@ class ActivityDeliveryService:
 
         effective = settings or self.settings
         # 与提醒推送共用同一套转发实现：支持就转发，不支持或失败就回退普通消息
-        if effective.use_forward_node and self.supports_forward(umo):
+        if effective.use_forward_node and self._can_forward(umo, effective):
             nodes = [self._plain_chain(forward_title), chain]
-            if await self._send_as_forward_nodes(umo, nodes, node_name):
+            if await self._send_as_forward_nodes(
+                umo, nodes, node_name, effective
+            ):
                 return True
 
         try:
@@ -443,6 +699,26 @@ class ActivityDeliveryService:
             logger.warning(f"活动推送发送失败 {umo}: {exc}")
             return False
 
+    def _ack_extra(
+        self,
+        umo: str,
+        settings: MessageSettings,
+        enabled: bool,
+        data: Any = None,
+        confirm: bool = False,
+    ) -> list[Any]:
+        """按需追加「我已知晓」按钮行。
+
+        走合并转发时按钮会被塞进转发节点里，QQ 不会渲染，所以转发分支必须跳过；
+        markdown 与 keyboard 是两个独立字段，可以共存，不用排除。
+        """
+        if not enabled or not self.supports_button(umo):
+            return []
+        if settings.use_forward_node and self._can_forward(umo, settings):
+            return []
+        row = self.build_ack_row(data, confirm=confirm)
+        return [row] if row is not None else []
+
     async def send_parts(
         self,
         umo: str,
@@ -451,21 +727,35 @@ class ActivityDeliveryService:
         *,
         node_name: str = NODE_NAME,
         forward_title: str = "",
+        ack_button: bool = False,
+        ack_data: Any = None,
+        ack_confirm: bool = False,
+        extra_rows: Sequence[Any] = (),
     ) -> bool:
         """发送消息片段；失败时逐级降级，尽量把内容送达。
 
         node_name 决定转发消息里每条的前缀（用游戏显示名），forward_title 是
-        转发里的标题节点。
+        转发里的标题节点；ack_button 为真时在消息末尾挂一个「我已知晓」按钮；
+        extra_rows 是调用方自己拼好的额外按钮行（摘要消息的「看详情」按钮），
+        它们排在「我已知晓」前面。
         """
         if not parts:
             return True
 
         effective = settings or self.settings
         items = await self.items_of(parts, effective)
+        # 不支持 inline keyboard 的平台（OneBot 等）连额外的按钮行也一起跳过，
+        # 否则调用方传进来的一行按钮会被当成未知组件塞进消息里。
+        extra = (
+            [row for row in extra_rows if row is not None]
+            if self.supports_button(umo)
+            else []
+        )
+        extra.extend(self._ack_extra(umo, effective, ack_button, ack_data, ack_confirm))
 
         if await self._try_send(
             umo,
-            self.build_chain(items),
+            self.build_chain(items) + extra,
             effective,
             node_name=node_name,
             forward_title=forward_title,
@@ -476,7 +766,7 @@ class ActivityDeliveryService:
             logger.warning(f"含封面的消息未能送达 {umo}，改为发送封面链接重试")
             if await self._try_send(
                 umo,
-                self.build_chain(items, images_as_links=True),
+                self.build_chain(items, images_as_links=True) + extra,
                 effective,
                 node_name=node_name,
                 forward_title=forward_title,
@@ -485,6 +775,29 @@ class ActivityDeliveryService:
 
         logger.error(f"活动推送最终发送失败 {umo}")
         return False
+
+    async def send_ack_prompt(
+        self,
+        umo: str,
+        text: str,
+        settings: MessageSettings | None = None,
+        data: Any = None,
+    ) -> bool:
+        """发一条带「确认不再提醒」/「取消确认」按钮的消息，作为二次确认。
+
+        这里**不走转发**：按钮塞进转发节点里 QQ 不会渲染，用户只能看到纯文本。
+        data 是随点击回传的回调上下文，测试指令靠它认出“这只是通路测试”。
+        """
+        chain: list[Any] = [Comp.Plain(text)]
+        row = self.build_ack_row(data, confirm=True)
+        if row is not None:
+            chain.append(row)
+        try:
+            await self.context.send_message(umo, MessageChain(chain=chain))
+            return True
+        except Exception as exc:
+            logger.warning(f"二次确认消息发送失败 {umo}: {exc}")
+            return False
 
     async def send_text(self, umo: str, text: str) -> bool:
         if not text:
@@ -508,22 +821,28 @@ class ActivityDeliveryService:
             return []
 
         effective = settings or self.settings
+        style = self.message_style(umo, effective)
 
         # 合并转发：一个游戏一条转发消息，游戏内的每个活动各自成为一个节点。
         # 多个游戏之间不合并——每个游戏仍然是自己的一条转发消息。
-        if effective.use_forward_node and self.supports_forward(umo):
+        # markdown 排版与转发互斥，_can_forward 里已经把这个条件算进去了。
+        if effective.use_forward_node and self._can_forward(umo, effective):
             ordered = self._ordered_plans(plans, now, effective)
             chains = await self._build_forward_nodes(ordered, now, effective)
             node_name = short_game_name(game, effective)
             title = self._forward_title(node_name, ordered, now, effective)
             nodes = [self._plain_chain(title)] + chains
-            if await self._send_as_forward_nodes(umo, nodes, node_name):
+            if await self._send_as_forward_nodes(
+                umo, nodes, node_name, effective
+            ):
                 return list(plans)
 
         node_name = short_game_name(game, effective)
         title = self._forward_title(node_name, plans, now, effective)
         if effective.single_message_per_game:
-            parts = build_reminder_parts(game, plans, now, effective)
+            parts = build_reminder_parts(
+                game, plans, now, effective, style=style
+            )
             return (
                 list(plans)
                 if await self.send_parts(
@@ -538,7 +857,9 @@ class ActivityDeliveryService:
 
         delivered: list[ReminderPlan] = []
         for plan in plans:
-            parts = build_single_reminder_parts(game, plan, now, effective)
+            parts = build_single_reminder_parts(
+                game, plan, now, effective, style=style
+            )
             if await self.send_parts(
                 umo,
                 parts,

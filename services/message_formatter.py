@@ -72,6 +72,30 @@ COVER_MODE_IMAGE = "image"
 COVER_MODES = (COVER_MODE_OFF, COVER_MODE_LINK, COVER_MODE_IMAGE)
 DEFAULT_COVER_MODE = COVER_MODE_IMAGE
 
+# ---- 消息渲染风格 ----
+# 同一个活动块有两种写法：plain 是给 onebot 之类普通消息用的纯文本，markdown
+# 是给 QQ 官方机器人用的。官方机器人的适配器默认把纯文本塞进 msg_type=2 的
+# markdown 内容里发送，所以带语法的文本会被渲染成排版，而不是原样显示。
+STYLE_PLAIN = "plain"
+STYLE_MARKDOWN = "markdown"
+MESSAGE_STYLES = (STYLE_PLAIN, STYLE_MARKDOWN)
+
+# 什么时候用 markdown：auto=看平台、on=强制、off=始终纯文本
+MARKDOWN_MODE_AUTO = "auto"
+MARKDOWN_MODE_ON = "on"
+MARKDOWN_MODE_OFF = "off"
+MARKDOWN_MODES = (MARKDOWN_MODE_AUTO, MARKDOWN_MODE_ON, MARKDOWN_MODE_OFF)
+DEFAULT_MARKDOWN_MODE = MARKDOWN_MODE_AUTO
+
+# markdown 里活动之间的水平分割线（普通消息用 activity_separator）
+MARKDOWN_ACTIVITY_SEPARATOR = "***"
+
+# 一条 markdown 消息里最多内嵌几张封面图。官方文档没写 markdown 的长度上限，
+# 一条消息塞一堆 ![]() 很可能被平台截断或静默丢图，所以默认只嵌第一张，
+# 其余的退回普通链接；0 表示一张都不嵌。
+DEFAULT_MARKDOWN_COVER_LIMIT = 1
+MARKDOWN_COVER_LIMIT_MAX = 20
+
 # ---- 剩余时间视觉标记 ----
 
 # 配置里可以直接写 emoji，也可以写颜色名，这里做一层映射
@@ -229,6 +253,8 @@ class MessageSettings:
     cover_max_width: int = DEFAULT_COVER_MAX_WIDTH
     cover_max_total_mb: int = DEFAULT_COVER_MAX_TOTAL_MB
     activity_separator: str = DEFAULT_ACTIVITY_SEPARATOR
+    # 是否用 markdown 排版：auto=按平台判断，on=强制，off=始终纯文本
+    markdown_mode: str = DEFAULT_MARKDOWN_MODE
     # 剩余时间标记（🟥 / 🟧 / 🟩 / 🟦）
     urgency_marker: bool = True
     urgency_rules: tuple[UrgencyLevel, ...] = DEFAULT_URGENCY_LEVELS
@@ -248,6 +274,8 @@ class MessageSettings:
     game_short_names: tuple[tuple[str, str], ...] = DEFAULT_GAME_SHORT_NAMES
     # 私聊提醒转发卡片的节点名；卡片里每行前面的那串字
     forward_node_name: str = DEFAULT_FORWARD_NODE_NAME
+    # 一条 markdown 消息里最多内嵌几张封面图（0 = 只给链接）
+    markdown_cover_limit: int = DEFAULT_MARKDOWN_COVER_LIMIT
 
     @property
     def cover_max_total_bytes(self) -> int:
@@ -259,6 +287,15 @@ class MessageSettings:
         if megabytes <= 0:
             return 0
         return megabytes * 1024 * 1024
+
+
+def normalize_markdown_cover_limit(value: object) -> int:
+    """把「一条消息嵌几张封面」归一化到 0..MARKDOWN_COVER_LIMIT_MAX。"""
+    try:
+        limit = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return DEFAULT_MARKDOWN_COVER_LIMIT
+    return max(0, min(MARKDOWN_COVER_LIMIT_MAX, limit))
 
 
 def normalize_cover_mode(value: object) -> str:
@@ -276,6 +313,30 @@ def normalize_cover_mode(value: object) -> str:
     }
     text = legacy.get(text, text)
     return text if text in COVER_MODES else DEFAULT_COVER_MODE
+
+
+def normalize_markdown_mode(value: object) -> str:
+    """把配置值规范化为 markdown 模式，并兼容布尔写法。
+
+    ``True`` / ``on`` 视为强制开启，``False`` / ``off`` 视为关闭；其余一律按
+    自动处理（交给发送层按平台判断）。无法识别的值回退到自动。
+    """
+    if isinstance(value, bool):
+        return MARKDOWN_MODE_ON if value else MARKDOWN_MODE_OFF
+    text = str(value or "").strip().lower()
+    legacy = {
+        "true": MARKDOWN_MODE_ON,
+        "false": MARKDOWN_MODE_OFF,
+        "enable": MARKDOWN_MODE_ON,
+        "enabled": MARKDOWN_MODE_ON,
+        "disable": MARKDOWN_MODE_OFF,
+        "disabled": MARKDOWN_MODE_OFF,
+        "开启": MARKDOWN_MODE_ON,
+        "关闭": MARKDOWN_MODE_OFF,
+        "自动": MARKDOWN_MODE_AUTO,
+    }
+    text = legacy.get(text, text)
+    return text if text in MARKDOWN_MODES else DEFAULT_MARKDOWN_MODE
 
 
 def normalize_game_aliases(value: object) -> tuple[tuple[str, str], ...]:
@@ -372,6 +433,67 @@ def _remaining_suffix(activity: Activity, now: datetime) -> str:
     return f"（剩余 {format_remaining(remaining)}）"
 
 
+def _md_url(url: str) -> str:
+    """markdown 链接里的 URL：空格和括号会截断语法，先转义掉。"""
+    return (
+        str(url or "")
+        .strip()
+        .replace(" ", "%20")
+        .replace("(", "%28")
+        .replace(")", "%29")
+    )
+
+
+class MarkdownCoverBudget:
+    """一条 markdown 消息的封面内嵌配额。
+
+    官方文档没写 markdown 的长度上限，一条消息里堆六七张 `![]()` 很可能被
+    平台截断或者干脆丢图；这里按 `settings.markdown_cover_limit` 发配额，
+    配额用完的封面退回普通链接（信息还在，只是不内嵌）。
+    """
+
+    __slots__ = ("remaining",)
+
+    def __init__(self, limit: int = DEFAULT_MARKDOWN_COVER_LIMIT) -> None:
+        self.remaining = normalize_markdown_cover_limit(limit)
+
+    def allow(self, cover: str) -> bool:
+        """这个活动能不能内嵌封面；没有封面的活动不占配额。"""
+        if not str(cover or "").strip():
+            return True
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
+
+
+def markdown_link(label: str, url: str) -> str:
+    """生成 markdown 链接；标签里的方括号换成全角，免得提前闭合。"""
+    safe_label = str(label or "").replace("[", "［").replace("]", "］")
+    return f"[{safe_label}]({_md_url(url)})"
+
+
+def markdown_image(alt: str, url: str) -> str:
+    """生成 markdown 内嵌图片。
+
+    只有公网 http(s) 地址才真的嵌图（QQ 官方机器人会自己下载转存，取不到就
+    静默丢图）；本地路径或相对地址没有下载入口，退回成普通链接。
+    """
+    target = str(url or "").strip()
+    if not target.lower().startswith(("http://", "https://")):
+        return markdown_link(alt, url)
+    safe_alt = str(alt or "").replace("[", "［").replace("]", "］")
+    return f"![{safe_alt}]({_md_url(target)})"
+
+
+def join_markdown_lines(lines: Sequence[str]) -> str:
+    """把行拼成 markdown 文本。
+
+    行尾补两个空格：markdown 里这才是硬换行，否则渲染器会把整段并成一句。
+    """
+    return "  \n".join(line for line in lines if line)
+
+
 def build_activity_block(
     activity: Activity,
     reasons: Sequence[str],
@@ -379,12 +501,23 @@ def build_activity_block(
     settings: MessageSettings,
     *,
     include_remaining: bool = True,
+    style: str = STYLE_PLAIN,
+    embed_cover: bool | None = None,
 ) -> list[MessagePart]:
     """构建单个活动的消息片段。
 
     封面按 ``settings.cover_mode`` 处理：``link`` 时写成文本行，``image`` 时作为
     独立的图片片段返回，``off`` 时完全不附带。
+
+    ``style`` 为 ``markdown`` 时改用 markdown 排版：标题加粗、详情写成链接，
+    封面按 ``settings.cover_mode`` 处理（``image`` 用 ``![]()`` 内嵌公网图、
+    ``link`` 只给链接），不产出图片片段 —— 官方机器人带图组件会被拆成多条。
+
+    ``embed_cover`` 为假时，markdown 模式下封面退回普通链接：一条消息里
+    内嵌图太多可能被平台截断，配额由调用方的 ``MarkdownCoverBudget`` 控制；
+    不传（None）时只看 ``settings.markdown_cover_limit`` 有没有余量。
     """
+    markdown = style == STYLE_MARKDOWN
     marker = ""
     if settings.urgency_marker:
         level = activity_urgency_level(activity, now, settings.urgency_rules)
@@ -397,6 +530,8 @@ def build_activity_block(
     if settings.headline_remaining and include_remaining:
         headline_suffix = _remaining_suffix(activity, now)
     headline = f"{marker}{prefix}{activity.name}{headline_suffix}"
+    if markdown and headline:
+        headline = f"**{headline}**"
 
     lines = [headline]
     if activity.start_time is not None:
@@ -418,16 +553,31 @@ def build_activity_block(
         lines.append(f"说明：{truncate(activity.description, MAX_DESCRIPTION_LENGTH)}")
 
     cover = str(activity.cover or "").strip()
-    if cover and settings.cover_mode == COVER_MODE_LINK:
-        lines.append(f"封面：{cover}")
+    if embed_cover is None:
+        embed_cover = settings.markdown_cover_limit > 0
+    if cover and settings.cover_mode != COVER_MODE_OFF:
+        if markdown:
+            # 图片组件会被拆条，markdown 里改用语法内嵌公网封面（取不到就丢图）
+            if settings.cover_mode == COVER_MODE_LINK or not embed_cover:
+                lines.append(markdown_link("封面图", cover))
+            else:
+                lines.append(markdown_image("封面图", cover))
+        elif settings.cover_mode == COVER_MODE_LINK:
+            lines.append(f"封面：{cover}")
     if activity.url:
-        hide_detail_link = (
-            cover
-            and settings.cover_mode == COVER_MODE_IMAGE
-            and not settings.image_mode_detail_link
-        )
-        if not hide_detail_link:
-            lines.append(f"详情：{activity.url}")
+        if markdown:
+            lines.append(markdown_link("详情", activity.url))
+        else:
+            hide_detail_link = (
+                cover
+                and settings.cover_mode == COVER_MODE_IMAGE
+                and not settings.image_mode_detail_link
+            )
+            if not hide_detail_link:
+                lines.append(f"详情：{activity.url}")
+
+    if markdown:
+        return [MessagePart(PART_TEXT, join_markdown_lines(lines))]
 
     parts = [MessagePart(PART_TEXT, "\n".join(lines))]
     if cover and settings.cover_mode == COVER_MODE_IMAGE:
@@ -547,26 +697,44 @@ def build_reminder_parts(
     plans: Sequence[ReminderPlan],
     now: datetime,
     settings: MessageSettings,
+    *,
+    style: str = STYLE_PLAIN,
 ) -> list[MessagePart]:
     """把一个游戏本轮的全部提醒合并为一条消息。
 
     开启 ``sort_by_urgency`` 时最紧急的活动排在最前，标题里附上各档位数量，
-    这样一眼就能看出这波提醒里有没有火烧眉毛的。
+    这样一眼就能看出这波提醒里有没有火烧眉毛的。``style`` 为 markdown 时
+    标题升级成二级标题、活动之间改用水平分割线。
     """
     ordered = (
         sort_plans_by_urgency(plans, now)
         if settings.sort_by_urgency
         else list(plans)
     )
+    # 一条消息里封面内嵌数量有上限（见 MarkdownCoverBudget），按排好的顺序发配额，
+    # 最紧急的那几个先拿到图。
+    budget = MarkdownCoverBudget(settings.markdown_cover_limit)
     blocks = [
-        build_activity_block(plan.activity, plan.reasons, now, settings)
+        build_activity_block(
+            plan.activity,
+            plan.reasons,
+            now,
+            settings,
+            style=style,
+            embed_cover=budget.allow(plan.activity.cover),
+        )
         for plan in ordered
     ]
-    header = f"🎮 {display_game_name(game, settings)} · 活动提醒"
+    markdown = style == STYLE_MARKDOWN
+    name = display_game_name(game, settings)
+    header = f"## 🎮 {name} · 活动提醒" if markdown else f"🎮 {name} · 活动提醒"
     summary = summarize_markers([plan.activity for plan in ordered], now, settings)
     if summary:
         header = f"{header}  {summary}"
-    return _assemble(header, blocks, settings.activity_separator)
+    separator = (
+        MARKDOWN_ACTIVITY_SEPARATOR if markdown else settings.activity_separator
+    )
+    return _assemble(header, blocks, separator)
 
 
 def build_single_reminder_parts(
@@ -574,12 +742,27 @@ def build_single_reminder_parts(
     plan: ReminderPlan,
     now: datetime,
     settings: MessageSettings,
+    *,
+    style: str = STYLE_PLAIN,
 ) -> list[MessagePart]:
     """只包含一个活动的提醒消息。"""
+    markdown = style == STYLE_MARKDOWN
+    name = display_game_name(game, settings)
+    header = f"## 🎮 {name} · 活动提醒" if markdown else f"🎮 {name} · 活动提醒"
+    budget = MarkdownCoverBudget(settings.markdown_cover_limit)
     return _assemble(
-        f"🎮 {display_game_name(game, settings)} · 活动提醒",
-        [build_activity_block(plan.activity, plan.reasons, now, settings)],
-        settings.activity_separator,
+        header,
+        [
+            build_activity_block(
+                plan.activity,
+                plan.reasons,
+                now,
+                settings,
+                style=style,
+                embed_cover=budget.allow(plan.activity.cover),
+            )
+        ],
+        MARKDOWN_ACTIVITY_SEPARATOR if markdown else settings.activity_separator,
     )
 
 
@@ -620,10 +803,15 @@ def section_heading(
     items: Sequence[Activity],
     now: datetime,
     settings: MessageSettings,
+    *,
+    style: str = STYLE_PLAIN,
 ) -> str:
     """分段标题：能统计档位时写成「▎进行中（🟦5 | 🟩1）」。"""
     markers = summarize_markers(items, now, settings)
-    return f"▎{label}（{markers or len(items)}）"
+    text = f"▎{label}（{markers or len(items)}）"
+    if style == STYLE_MARKDOWN:
+        return f"### {text}"
+    return text
 
 
 def overview_title_candidates(
@@ -676,6 +864,7 @@ def build_overview_parts(
     settings: MessageSettings,
     *,
     source_name: str = "",
+    style: str = STYLE_PLAIN,
 ) -> list[MessagePart]:
     """构建「当前活动一览」，用于订阅确认与手动查询。"""
     active = sorted(
@@ -688,14 +877,27 @@ def build_overview_parts(
     )
 
     segments: list[str | list[MessagePart]] = []
+    # 整条一览是一条消息，封面内嵌也要共用同一份额度
+    budget = MarkdownCoverBudget(settings.markdown_cover_limit)
 
     if not active and not upcoming:
         segments.append("当前没有进行中或即将开始的活动。")
     else:
         if active:
-            segments.append(section_heading("进行中", active, now, settings))
+            segments.append(
+                section_heading("进行中", active, now, settings, style=style)
+            )
             for item in active[:MAX_ACTIVE_IN_OVERVIEW]:
-                segments.append(build_activity_block(item, (), now, settings))
+                segments.append(
+                    build_activity_block(
+                        item,
+                        (),
+                        now,
+                        settings,
+                        style=style,
+                        embed_cover=budget.allow(item.cover),
+                    )
+                )
             if len(active) > MAX_ACTIVE_IN_OVERVIEW:
                 segments.append(
                     f"……另有 {len(active) - MAX_ACTIVE_IN_OVERVIEW} 个进行中的活动"
@@ -703,7 +905,7 @@ def build_overview_parts(
 
         if upcoming:
             segments.append(
-                section_heading("即将开始", upcoming, now, settings)
+                section_heading("即将开始", upcoming, now, settings, style=style)
             )
             for item in upcoming[:MAX_UPCOMING_IN_OVERVIEW]:
                 segments.append(
@@ -713,6 +915,8 @@ def build_overview_parts(
                         now,
                         settings,
                         include_remaining=False,
+                        style=style,
+                        embed_cover=budget.allow(item.cover),
                     )
                 )
             if len(upcoming) > MAX_UPCOMING_IN_OVERVIEW:
@@ -723,11 +927,16 @@ def build_overview_parts(
     if source_name:
         segments.append(f"（数据来源：{source_name}）")
 
-    return _assemble(
-        f"🎮 {display_game_name(game, settings)} · 当前活动",
-        segments,
-        settings.activity_separator,
+    markdown = style == STYLE_MARKDOWN
+    header = (
+        f"## 🎮 {display_game_name(game, settings)} · 当前活动"
+        if markdown
+        else f"🎮 {display_game_name(game, settings)} · 当前活动"
     )
+    separator = (
+        MARKDOWN_ACTIVITY_SEPARATOR if markdown else settings.activity_separator
+    )
+    return _assemble(header, segments, separator)
 
 
 def build_overview_blocks(
@@ -737,6 +946,7 @@ def build_overview_blocks(
     settings: MessageSettings,
     *,
     source_name: str = "",
+    style: str = STYLE_PLAIN,
 ) -> tuple[str, list[list[MessagePart]]]:
     """构建「当前活动一览」的标题与逐活动片段。
 
@@ -758,7 +968,7 @@ def build_overview_blocks(
 
     blocks: list[list[MessagePart]] = []
     for item in active[:MAX_ACTIVE_IN_OVERVIEW]:
-        blocks.append(build_activity_block(item, (), now, settings))
+        blocks.append(build_activity_block(item, (), now, settings, style=style))
     if len(active) > MAX_ACTIVE_IN_OVERVIEW:
         blocks.append(
             [
@@ -770,7 +980,9 @@ def build_overview_blocks(
         )
     for item in upcoming[:MAX_UPCOMING_IN_OVERVIEW]:
         blocks.append(
-            build_activity_block(item, (), now, settings, include_remaining=False)
+            build_activity_block(
+                item, (), now, settings, include_remaining=False, style=style
+            )
         )
     if len(upcoming) > MAX_UPCOMING_IN_OVERVIEW:
         blocks.append(
@@ -796,8 +1008,12 @@ def build_reminder_message(
     plans: Sequence[ReminderPlan],
     now: datetime,
     settings: MessageSettings,
+    *,
+    style: str = STYLE_PLAIN,
 ) -> str:
-    return parts_to_text(build_reminder_parts(game, plans, now, settings))
+    return parts_to_text(
+        build_reminder_parts(game, plans, now, settings, style=style)
+    )
 
 
 def build_single_reminder_message(
@@ -805,8 +1021,12 @@ def build_single_reminder_message(
     plan: ReminderPlan,
     now: datetime,
     settings: MessageSettings,
+    *,
+    style: str = STYLE_PLAIN,
 ) -> str:
-    return parts_to_text(build_single_reminder_parts(game, plan, now, settings))
+    return parts_to_text(
+        build_single_reminder_parts(game, plan, now, settings, style=style)
+    )
 
 
 def build_overview_message(
@@ -816,9 +1036,12 @@ def build_overview_message(
     settings: MessageSettings,
     *,
     source_name: str = "",
+    style: str = STYLE_PLAIN,
 ) -> str:
     return parts_to_text(
-        build_overview_parts(game, activities, now, settings, source_name=source_name)
+        build_overview_parts(
+            game, activities, now, settings, source_name=source_name, style=style
+        )
     )
 
 
@@ -899,24 +1122,50 @@ def build_urgent_dm_body_parts(
     *,
     headline: str = "",
     ack_hint: str = "",
+    style: str = STYLE_PLAIN,
 ) -> list[MessagePart]:
     """构建紧急私聊提醒的正文（按游戏分组的详情）。
 
     ``headline`` 是正文最上面那一行（通常是各游戏分布），为空时不占位。
-    分组之间用 ``===========`` 隔开，组内活动之间用普通分隔线。
+    分组之间用 ``===========`` 隔开，组内活动之间用普通分隔线。markdown 模式
+    下这两级分隔线都换成 ``***``，分组标题升级成三级标题。
     """
+    markdown = style == STYLE_MARKDOWN
+    game_separator = (
+        MARKDOWN_ACTIVITY_SEPARATOR if markdown else DEFAULT_GAME_SEPARATOR
+    )
     segments: list[str | list[MessagePart]] = []
+    # 整条紧急提醒是一条消息，所有分组共用同一份封面上限
+    budget = MarkdownCoverBudget(settings.markdown_cover_limit)
     for index, group in enumerate(groups):
         if index:
-            segments.append(DEFAULT_GAME_SEPARATOR)
-        segments.append(f"🎮 {group.name}（{len(group.activities)} 个）")
+            segments.append(game_separator)
+        group_title = f"🎮 {group.name}（{len(group.activities)} 个）"
+        if markdown:
+            group_title = f"### {group_title}"
+        segments.append(group_title)
         segments.extend(
-            build_activity_block(activity, (), now, settings)
+            build_activity_block(
+                activity,
+                (),
+                now,
+                settings,
+                style=style,
+                embed_cover=budget.allow(activity.cover),
+            )
             for activity in group.activities
         )
     if ack_hint:
         segments.append(ack_hint)
-    return _assemble(headline, segments, settings.activity_separator)
+    if markdown and headline:
+        first, _, rest = headline.partition("\n")
+        headline = f"## {first}"
+        if rest:
+            headline = f"{headline}  \n{rest.replace(chr(10), chr(32) * 2 + chr(10))}"
+    separator = (
+        MARKDOWN_ACTIVITY_SEPARATOR if markdown else settings.activity_separator
+    )
+    return _assemble(headline, segments, separator)
 
 
 def build_urgent_dm_parts(
@@ -926,6 +1175,7 @@ def build_urgent_dm_parts(
     *,
     ack_hint: str = "",
     games: Mapping[str, Game] | None = None,
+    style: str = STYLE_PLAIN,
 ) -> list[MessagePart]:
     """构建紧急私聊提醒的消息片段（一条普通消息）。
 
@@ -941,7 +1191,54 @@ def build_urgent_dm_parts(
         settings,
         headline=build_urgent_dm_title(groups, settings),
         ack_hint=ack_hint,
+        style=style,
     )
+
+
+def most_urgent_activity(
+    activities: Sequence[Activity],
+    now: datetime,
+) -> Activity | None:
+    """剩余时间最短的那条活动（用来在摘要里给一个「最急」的抓手）。"""
+    if not activities:
+        return None
+    return min(activities, key=lambda item: _remaining_key(item, now))
+
+
+def build_urgent_dm_summary_parts(
+    activities: Sequence[Activity],
+    now: datetime,
+    settings: MessageSettings,
+    *,
+    games: Mapping[str, Game] | None = None,
+    ack_hint: str = "",
+    style: str = STYLE_PLAIN,
+) -> list[MessagePart]:
+    """构建「摘要 + 按钮」模式的正文。
+
+    同时结束的活动一多，详情一股脑塞进一条消息就会被忽略，而且 QQ 官方机器人
+    没有合并转发可用。这种模式只发三行：总条数、各游戏分布、最急的那条还剩多久，
+    详细内容交给底下的按钮按需展开。
+    """
+    groups = build_urgent_dm_groups(activities, now, settings, games=games)
+    if not groups:
+        return []
+    lines = [build_urgent_dm_headline(groups)]
+    summary = build_urgent_dm_summary(groups)
+    if summary:
+        lines.append(f"🚨 {summary}")
+    urgent = most_urgent_activity(activities, now)
+    if urgent is not None:
+        remaining = format_remaining(urgent.remaining(now))
+        if remaining:
+            lines.append(f"最急：{urgent.name}（剩 {remaining}）")
+    if ack_hint:
+        lines.append(ack_hint)
+    text = "\n".join(lines)
+    if style == STYLE_MARKDOWN:
+        first, _, rest = text.partition("\n")
+        text = f"## {first}" + (f"  \n{rest}" if rest else "")
+    return [MessagePart(PART_TEXT, text)]
 
 
 def build_urgent_dm_message(
@@ -951,9 +1248,15 @@ def build_urgent_dm_message(
     *,
     ack_hint: str = "",
     games: Mapping[str, Game] | None = None,
+    style: str = STYLE_PLAIN,
 ) -> str:
     return parts_to_text(
         build_urgent_dm_parts(
-            activities, now, settings, ack_hint=ack_hint, games=games
+            activities,
+            now,
+            settings,
+            ack_hint=ack_hint,
+            games=games,
+            style=style,
         )
     )

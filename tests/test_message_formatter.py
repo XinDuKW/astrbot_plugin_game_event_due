@@ -968,3 +968,43 @@ def test_urgent_preview_without_games_returns_empty():
     assert preview["nodes"] == []
     assert preview["games"] == []
     assert preview["plain_lines"] == []
+    assert preview["summary_lines"] == []
+    assert preview["detail_buttons"] == []
+    assert preview["ack_label"] == ""
+
+
+def test_urgent_preview_carries_summary_and_buttons_when_enough_activities():
+    preview = build_urgent_preview(
+        SRA_GAMES,
+        NOW,
+        SETTINGS,
+        count=3,
+        detail_min=3,
+        ack_button=True,
+        max_buttons=4,
+        all_label="全部",
+        ack_label="我已知晓",
+    )
+
+    # 3 个游戏共 6 个活动，够 detail_min，预览改成摘要 + 按钮
+    # markdown 的行尾带两个空格（换行符），比较时先 strip
+    assert preview["summary_lines"][0].strip() == "## 🚨 6 个活动马上就要结束了！"
+    assert preview["ack_label"] == "我已知晓"
+    assert preview["detail_buttons"][-1] == "全部"
+    assert len(preview["detail_buttons"]) == len(preview["games"]) + 1
+
+
+def test_urgent_preview_keeps_detail_lines_when_buttons_disabled():
+    preview = build_urgent_preview(
+        SRA_GAMES,
+        NOW,
+        SETTINGS,
+        count=3,
+        ack_button=False,
+        ack_label="我已知晓",
+    )
+
+    assert preview["summary_lines"] == []
+    assert preview["detail_buttons"] == []
+    assert preview["ack_label"] == ""
+    assert preview["markdown_lines"]

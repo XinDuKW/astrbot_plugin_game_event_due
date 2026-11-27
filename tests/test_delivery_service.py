@@ -118,12 +118,13 @@ def test_forward_chain_named_needs_at_least_two_nodes():
 
 
 def test_supports_forward_only_on_aiocqhttp():
-    assert ActivityDeliveryService.supports_forward(UMO) is True
-    assert ActivityDeliveryService.supports_forward("aiocqhttp:GroupMessage:1")
+    service = ActivityDeliveryService(FakeContext(), SETTINGS, resolver=None)
+    assert service.supports_forward(UMO) is True
+    assert service.supports_forward("aiocqhttp:GroupMessage:1")
     # QQ 官方机器人会忽略 Node/Nodes 且不报错，整条消息会被静默丢弃
-    assert ActivityDeliveryService.supports_forward("qq_official:FriendMessage:x") is False
-    assert ActivityDeliveryService.supports_forward("telegram:FriendMessage:1") is False
-    assert ActivityDeliveryService.supports_forward("") is False
+    assert service.supports_forward("qq_official:FriendMessage:x") is False
+    assert service.supports_forward("telegram:FriendMessage:1") is False
+    assert service.supports_forward("") is False
 
 
 def test_urgent_forward_on_qq_official_falls_back_to_plain_message():

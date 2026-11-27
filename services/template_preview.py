@@ -17,14 +17,17 @@ from typing import Any
 from ..sources.base import Activity, Game
 from .message_formatter import (
     DEFAULT_FORWARD_NODE_NAME,
+    STYLE_MARKDOWN,
     MessageSettings,
     UrgencyLevel,
     build_activity_block,
+    build_overview_parts,
     build_overview_title,
     build_urgent_dm_body_parts,
     build_urgent_dm_groups,
     build_urgent_dm_headline,
     build_urgent_dm_summary,
+    build_urgent_dm_summary_parts,
     build_urgent_dm_title,
     display_game_name,
     parts_to_text,
@@ -163,6 +166,18 @@ def build_template_preview(
     if source_name:
         sections.append({"kind": "note", "text": f"（数据来源：{source_name}）"})
 
+    # markdown 排版的预览：直接用真正发送时的那套渲染，避免「预览一套、发出另一套」
+    markdown_text = parts_to_text(
+        build_overview_parts(
+            game,
+            list(active[:limit]) + list(upcoming[:limit]),
+            now,
+            settings,
+            source_name=source_name,
+            style=STYLE_MARKDOWN,
+        )
+    )
+
     node_name = short_game_name(game, settings)
     nodes: list[dict[str, Any]] = []
     for item in active[:limit]:
@@ -182,6 +197,7 @@ def build_template_preview(
             "header": f"🎮 {display_game_name(game, settings)} · 当前活动",
             "sections": sections,
         },
+        "markdown": {"text": markdown_text},
         "forward": {
             "card_title": FORWARD_CARD_TITLE,
             "title_node": {
@@ -247,8 +263,18 @@ def build_urgent_preview(
     *,
     count: int = 3,
     ack_hint: str = URGENT_ACK_HINT,
+    detail_min: int = 3,
+    ack_button: bool = True,
+    max_buttons: int = 4,
+    all_label: str = "全部",
+    ack_label: str = "我已知晓",
 ) -> dict[str, Any]:
-    """模拟「N 个游戏同时到期」时的那条私聊提醒，供模板编辑器预览。"""
+    """模拟「N 个游戏同时到期」时的那条私聊提醒，供模板编辑器预览。
+
+    ``ack_button`` 为真且活动数达到 ``detail_min`` 时，真正发出去的是
+    「摘要 + 看详情按钮」而不是逐条详情，预览也按这个画：摘要行与按钮文字
+    都由这里算，避免页面显示一套、线上发另一套。
+    """
     count = max(2, min(6, int(count)))
     per_game = 2 if count <= 3 else 1
     activities = simulate_urgent_activities(
@@ -264,14 +290,38 @@ def build_urgent_preview(
             "headline": build_urgent_dm_headline(groups),
             "summary": "",
             "ack_hint": ack_hint,
+            "summary_lines": [],
+            "detail_buttons": [],
+            "ack_label": "",
             "nodes": [],
             "games": [],
             "plain_lines": [],
+            "markdown_lines": [],
         }
 
     headline = build_urgent_dm_headline(groups)
     summary = f"🚨 {build_urgent_dm_summary(groups)}"
     title = build_urgent_dm_title(groups, settings)
+
+    # 与 polling_service 的判定保持一致：平台有按钮能力、活动够多时走摘要
+    use_summary = bool(ack_button and len(activities) >= max(2, int(detail_min)))
+    summary_lines: list[str] = []
+    detail_buttons: list[str] = []
+    if use_summary:
+        summary_lines = parts_to_text(
+            build_urgent_dm_summary_parts(
+                activities,
+                now,
+                settings,
+                games=lookup,
+                ack_hint=ack_hint,
+                style=STYLE_MARKDOWN,
+            )
+        ).split("\n")
+        detail_buttons = [
+            group.short for group in groups[: max(1, int(max_buttons))]
+        ]
+        detail_buttons.append(all_label)
 
     nodes: list[dict[str, Any]] = [{"name": node_name, "lines": [headline]}]
     if summary:
@@ -296,12 +346,25 @@ def build_urgent_preview(
             ack_hint=ack_hint,
         )
     ).split("\n")
+    markdown_lines = parts_to_text(
+        build_urgent_dm_body_parts(
+            groups,
+            now,
+            settings,
+            headline=title,
+            ack_hint=ack_hint,
+            style=STYLE_MARKDOWN,
+        )
+    ).split("\n")
 
     return {
         "count": count,
         "headline": headline,
         "summary": summary,
         "ack_hint": ack_hint,
+        "summary_lines": summary_lines,
+        "detail_buttons": detail_buttons,
+        "ack_label": ack_label if (use_summary and ack_button) else "",
         "nodes": nodes,
         "games": [
             {
@@ -317,4 +380,5 @@ def build_urgent_preview(
             for group in groups
         ],
         "plain_lines": plain_lines,
+        "markdown_lines": markdown_lines,
     }

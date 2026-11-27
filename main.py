@@ -17,7 +17,16 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, StarTools
 
 from .services.cover_service import CoverResolver
-from .services.delivery_service import ActivityDeliveryService
+from .services.delivery_service import (
+    ACK_BUTTON_ID,
+    ACK_BUTTON_TEST_DATA,
+    ACK_CANCEL_BUTTON_ID,
+    ACK_CONFIRM_BUTTON_ID,
+    DETAIL_ALL,
+    DETAIL_ALL_LABEL,
+    DETAIL_MAX_BUTTONS,
+    ActivityDeliveryService,
+)
 from .services.message_formatter import (
     COVER_MODE_IMAGE,
     COVER_MODE_LINK,
@@ -28,20 +37,34 @@ from .services.message_formatter import (
     DEFAULT_COVER_MODE,
     DEFAULT_FORWARD_NODE_NAME,
     DEFAULT_GAME_SHORT_NAMES,
+    DEFAULT_MARKDOWN_COVER_LIMIT,
+    DEFAULT_MARKDOWN_MODE,
     DEFAULT_URGENCY_RULES,
+    PART_TEXT,
+    MessagePart,
     MessageSettings,
     build_overview_parts,
+    build_urgent_dm_groups,
+    build_urgent_dm_parts,
+    build_urgent_dm_summary_parts,
     display_game_name,
     normalize_cover_mode,
     normalize_game_aliases,
     normalize_game_short_names,
+    normalize_markdown_cover_limit,
+    normalize_markdown_mode,
     parse_urgency_rules,
     short_game_name,
 )
-from .services.template_preview import format_game_pairs, format_urgency_rules
+from .services.template_preview import (
+    format_game_pairs,
+    format_urgency_rules,
+    simulate_urgent_activities,
+)
 from .services.polling_service import ActivityPollingService, PollingSettings
 from .services.reminder_service import ReminderPolicy, normalize_thresholds
 from .services.subscription_service import (
+    BIND_CODE_TTL_MINUTES,
     SubscriptionService,
     resolve_message_settings,
     resolve_policy,
@@ -58,13 +81,17 @@ from .sources import (
 from .services.urgent_dm_service import (
     TARGET_SETTING_KEYS,
     UrgentDmSettings,
+    certification_tip,
     describe_target_settings,
     is_ack_text,
     normalize_ack_keywords,
+    normalize_certification,
+    normalize_detail_target,
     normalize_games,
     normalize_targets,
     parse_quiet_hours,
     parse_target_settings,
+    private_dm_blocked_hint,
     target_settings,
 )
 from .sources.registry import GameRegistry
@@ -98,13 +125,20 @@ USAGE_URGENT_DM = (
     "/活动私人提醒 列表        查看提醒目标与各自的节奏\n"
     "/活动私人提醒 停止        暂停对自己的紧急提醒（设置与记录保留）\n"
     "/活动私人提醒 开启        重新开启暂停的紧急提醒\n"
+    "/活动私人提醒 加入        把自己加入（在群里执行会先试探私聊能不能发到）\n"
+    "/活动私人提醒 绑定        在群里拿绑定码，私聊发「/活动私人提醒 绑定 123456」完成绑定\n"
     "/活动私人提醒 测试        给自己发一条测试私聊\n"
+    "/活动私人提醒 测试 按钮   发一条带「我已知晓」按钮的测试私聊"
+    "（开了二次确认会再弹一条确认/取消的测试消息，都不动真实提醒）\n"
+    "/活动私人提醒 测试 详情   发一条带「看详情」按钮的摘要测试私聊"
+    "（点按钮只会发示例活动，不动真实提醒）\n"
     "设置的单位：3天=剩余不足 3 天就开始催，2小时=每 2 小时催一次，"
     "3次=每天最多 3 次；\n"
     "填「默认」恢复跟随全局配置。也可以直接贴 aiocqhttp:FriendMessage:123456 "
     "这种会话号指定目标。\n"
     "被提醒的人回一句 /我已知晓 就停掉最近那一轮提醒；跟上活动名只停那一个，\n"
-    "写「全部」则一次停掉所有活动。"
+    "写「全部」则一次停掉所有活动。QQ 官方机器人的提醒底部带「我已知晓」按钮，\n"
+    "点一下同样算确认。"
 )
 USAGE_FILTER = (
     "用法:\n"
@@ -225,6 +259,18 @@ class GameActivityPlugin(Star):
                 self._cfg("urgent_dm", "ack_keywords", "")
             ),
             games=normalize_games(self._cfg("urgent_dm", "games", "")),
+            ack_button=self._cfg_bool("urgent_dm", "ack_button", True),
+            ack_button_confirm=self._cfg_bool(
+                "urgent_dm", "ack_button_confirm", True
+            ),
+            detail_button=self._cfg_bool("urgent_dm", "detail_button", True),
+            detail_min=max(2, self._cfg_int("urgent_dm", "detail_min", 3)),
+            detail_target=normalize_detail_target(
+                self._cfg_str("urgent_dm", "detail_target", "private")
+            ),
+            certification=normalize_certification(
+                self._cfg_str("urgent_dm", "certification", "unknown")
+            ),
         )
 
         self.http_client = JsonHttpClient(
@@ -328,6 +374,9 @@ class GameActivityPlugin(Star):
             "activity_separator",
             DEFAULT_ACTIVITY_SEPARATOR,
         ).strip("\r\n")[:MAX_SEPARATOR_LENGTH],
+        markdown_mode=normalize_markdown_mode(
+            self._cfg("message_format", "markdown_mode", DEFAULT_MARKDOWN_MODE)
+        ),
         urgency_marker=self._cfg_bool(
             "message_format", "urgency_marker", True
         ),
@@ -368,6 +417,13 @@ class GameActivityPlugin(Star):
             ).strip()
             or DEFAULT_FORWARD_NODE_NAME
         ),
+        markdown_cover_limit=normalize_markdown_cover_limit(
+            self._cfg_int(
+                "message_format",
+                "markdown_cover_limit",
+                DEFAULT_MARKDOWN_COVER_LIMIT,
+            )
+        ),
         )
 
     def reload_message_settings(self) -> None:
@@ -393,11 +449,13 @@ class GameActivityPlugin(Star):
             "headline_remaining": settings.headline_remaining,
             "sort_by_urgency": settings.sort_by_urgency,
             "activity_separator": settings.activity_separator,
+            "markdown_mode": settings.markdown_mode,
             "include_description": settings.include_description,
             "include_tags": settings.include_tags,
             "include_extra_times": settings.include_extra_times,
             "cover_mode": settings.cover_mode,
             "image_mode_detail_link": settings.image_mode_detail_link,
+            "markdown_cover_limit": settings.markdown_cover_limit,
         }
 
     # ---- 配置读取辅助 ----
@@ -884,6 +942,7 @@ class GameActivityPlugin(Star):
                 now,
                 settings,
                 source_name=source_name,
+                style=self.delivery.message_style(umo, settings),
             )
             yield event.chain_result(
                 await self.delivery.build_event_chain(
@@ -1115,7 +1174,9 @@ class GameActivityPlugin(Star):
                 lines.append(f"· {target}（{games}）{pace}{detail}")
             if not lines:
                 yield event.plain_result(
-                    "当前没有紧急私聊提醒目标。\n\n" + USAGE_URGENT_DM
+                    "当前没有紧急私聊提醒目标。\n"
+                    "想加自己：/活动私人提醒 加入（QQ 官方机器人发不出私聊时会给你绑定码）\n\n"
+                    + USAGE_URGENT_DM
                 )
                 return
             yield event.plain_result("紧急私聊提醒目标:\n" + "\n".join(lines))
@@ -1147,19 +1208,164 @@ class GameActivityPlugin(Star):
             yield event.plain_result("✅ 已重新开启对你的紧急私聊提醒。")
             return
 
-        if action in ("测试", "test"):
-            # 测试消息必须落在执行者自己的私聊：群里执行也要私聊收到
-            ok = await self.delivery.send_text(
-                self_umo, "🔔 这是一条测试提醒：主动私聊可用。"
-            )
+        if action in ("加入", "join", "订阅"):
+            data = await self.subscriptions.get_urgent_dm()
+            in_private = "FriendMessage" in umo
+            if not in_private:
+                # 群里执行：先试探能不能主动私聊到本人，发不出去再给绑定码
+                ok = await self.delivery.send_parts(
+                    self_umo,
+                    [
+                        MessagePart(
+                            PART_TEXT,
+                            "🔔 紧急私聊提醒已开通：活动快结束时我会私聊催你。\n"
+                            "回一句 /我已知晓 就停掉最近这一轮。",
+                        )
+                    ],
+                )
+                if not ok:
+                    code = await self._issue_bind_code(
+                        umo, self._event_sender_id(event)
+                    )
+                    yield event.plain_result(
+                        private_dm_blocked_hint(
+                            self.urgent_dm.certification,
+                            code=code,
+                            ttl_minutes=BIND_CODE_TTL_MINUTES,
+                        )
+                    )
+                    return
+            SubscriptionService.upsert_urgent_target(data, self_umo, enabled=True)
+            await self.subscriptions.save_urgent_dm(data)
             yield event.plain_result(
-                f"✅ 测试消息已发到你的私聊（{self_umo}），去私聊看看。"
-                if ok
-                else "❌ 测试消息发送失败，请确认适配器支持主动私聊。"
+                "✅ 已加入紧急私聊提醒，刚给你发了一条私聊，去看看。"
+                if not in_private
+                else "✅ 已加入紧急私聊提醒：活动快结束时我会私聊催你。\n"
+                "回一句 /我已知晓 就停掉最近这一轮。"
             )
             return
 
-        targets = self._mention_targets(event, umo)
+        if action in ("绑定", "bind", "绑定码"):
+            code = ""
+            for item in tokens[1:]:
+                if item.isdigit():
+                    code = item
+                    break
+            if "FriendMessage" not in umo:
+                if code:
+                    yield event.plain_result(
+                        "绑定码要在私聊里发给我：先私聊我，再发 "
+                        f"/活动私人提醒 绑定 {code}"
+                    )
+                    return
+                issued = await self._issue_bind_code(
+                    umo, self._event_sender_id(event)
+                )
+                yield event.plain_result(
+                    f"🔑 绑定码：{issued}\n"
+                    "1. 手机QQ → 联系人 → 机器人 → 找到我\n"
+                    f"2. 私聊发：/活动私人提醒 绑定 {issued}\n"
+                    f"（{BIND_CODE_TTL_MINUTES} 分钟内有效，只认第一次）"
+                )
+                return
+            if not code:
+                data = await self.subscriptions.get_urgent_dm()
+                SubscriptionService.upsert_urgent_target(data, umo, enabled=True)
+                await self.subscriptions.save_urgent_dm(data)
+                yield event.plain_result(
+                    "✅ 已把你加入紧急私聊提醒（现在就在私聊里，直接可用）。"
+                )
+                return
+
+            now = datetime.now(GAME_TIMEZONE)
+            codes = await self.subscriptions.get_bind_codes()
+            entry = SubscriptionService.consume_bind_code(codes, code, now)
+            if entry is None:
+                yield event.plain_result(
+                    "❌ 绑定码无效或已过期。\n"
+                    "在群里发 /活动私人提醒 绑定 可以重新拿一个。"
+                )
+                return
+            await self.subscriptions.save_bind_codes(codes)
+
+            data = await self.subscriptions.get_urgent_dm()
+            SubscriptionService.upsert_urgent_target(data, umo, enabled=True)
+            platform = umo.split(":", 1)[0] if ":" in umo else ""
+            sender = str(entry.get("sender") or "").strip()
+            dropped = ""
+            if platform and sender:
+                stale = f"{platform}:FriendMessage:{sender}"
+                if stale != umo and SubscriptionService.remove_urgent_target(
+                    data, stale
+                ):
+                    dropped = f"\n（顺手清掉了那条发不出去的临时记录：{stale}）"
+            await self.subscriptions.save_urgent_dm(data)
+            yield event.plain_result(
+                "✅ 绑定成功：以后活动快结束我会私聊催你。\n"
+                "回一句 /我已知晓 就停掉最近这一轮。" + dropped
+            )
+            return
+
+        if action in ("测试", "test"):
+            # 测试消息必须落在执行者自己的私聊：群里执行也要私聊收到
+            want_button = any(
+                item in ("按钮", "button", "按钮测试") for item in tokens[1:]
+            )
+            want_detail = any(
+                item in ("详情", "详细", "detail") for item in tokens[1:]
+            )
+            if want_detail:
+                if not self.delivery.supports_button(self_umo):
+                    yield event.plain_result(
+                        "当前平台画不出按钮（只有 QQ 官方机器人支持）。\n"
+                        "先去试普通测试消息：/活动私人提醒 测试"
+                    )
+                    return
+                yield event.plain_result(
+                    await self._send_detail_test(self_umo)
+                )
+                return
+            if want_button and not self.delivery.supports_button(self_umo):
+                yield event.plain_result(
+                    "当前平台画不出按钮（只有 QQ 官方机器人支持）。\n"
+                    "先去试普通测试消息：/活动私人提醒 测试"
+                )
+                return
+            text = (
+                "🔔 按钮测试：点下面的「我已知晓」。\n"
+                "正常情况下点一次就结束 loading，然后我会回你一句，"
+                "说明这次点击已经送到插件。"
+                if want_button
+                else "🔔 这是一条测试提醒：主动私聊可用。"
+            )
+            ok = await self.delivery.send_parts(
+                self_umo,
+                [MessagePart(PART_TEXT, text)],
+                ack_button=want_button,
+                ack_data=ACK_BUTTON_TEST_DATA if want_button else None,
+            )
+            if not ok:
+                yield event.plain_result(
+                    "❌ 测试消息发送失败，请确认适配器支持主动私聊。"
+                    + certification_tip(self.urgent_dm.certification)
+                )
+                return
+            yield event.plain_result(
+                f"✅ 测试消息已发到你的私聊（{self_umo}），去私聊看看。"
+                + (
+                    "\n按钮点一次就会回调；点了没反应就翻下 AstrBot 日志。"
+                    if want_button
+                    else ""
+                )
+            )
+            return
+
+        targets = self._mention_targets(
+            event,
+            umo,
+            self_umo=self_umo,
+            self_sender=self._event_sender_id(event),
+        )
         if not targets and "FriendMessage" in umo:
             targets = [umo]
 
@@ -1203,7 +1409,7 @@ class GameActivityPlugin(Star):
             if not targets:
                 yield event.plain_result("请 @ 要移除的人。\n\n" + USAGE_URGENT_DM)
                 return
-            if not is_admin and any(target != umo for target in targets):
+            if not is_admin and any(target not in (umo, self_umo) for target in targets):
                 yield event.plain_result("只有管理员可以移除别人。")
                 return
             data = await self.subscriptions.get_urgent_dm()
@@ -1224,9 +1430,20 @@ class GameActivityPlugin(Star):
         if not targets:
             yield event.plain_result(USAGE_URGENT_DM)
             return
-        if not is_admin and any(target != umo for target in targets):
+        if not is_admin and any(target not in (umo, self_umo) for target in targets):
             yield event.plain_result("只有管理员可以把别人加入紧急提醒。")
             return
+
+        if self.delivery.supports_button(umo):
+            # QQ 官方平台：群成员 openid 与私聊 openid 不保证通用，替别人开通只会存下发不出去的记录
+            others = [target for target in targets if target != self_umo]
+            if others:
+                yield event.plain_result(
+                    "QQ 官方机器人拿不到别人的私聊标识，没法替别人开通。\n"
+                    "让对方自己发 /活动私人提醒 加入，或者在群里发 /活动私人提醒 绑定，"
+                    "拿码后去私聊里认领。"
+                )
+                return
 
         data = await self.subscriptions.get_urgent_dm()
         for target in targets:
@@ -1265,6 +1482,229 @@ class GameActivityPlugin(Star):
         event.stop_event()
         yield event.plain_result(self._ack_reply(acked, ack_all=ack_all))
 
+    # 按钮事件只会被带 ButtonActionFilter 的 handler 接住（waking_check 阶段会把
+    # 其它 handler 全部跳过），所以这里必须用 button_action 而不是 event_message_type。
+    @filter.button_action(ACK_BUTTON_ID)
+    async def ack_by_button(self, event: AstrMessageEvent):
+        """点提醒里的「我已知晓」按钮（QQ 官方机器人）。
+
+        AstrBot 在把事件交给插件**之前**就已经 ack 掉了这次 interaction，
+        所以点击不会卡 loading。开了 `ack_button_confirm` 时这里只发二次确认
+        消息（带「确认不再提醒」按钮），真正停提醒的是 `confirm_ack_by_button`。
+        """
+        data = self._button_data(event)
+
+        # 测试按钮（/活动私人提醒 测试 按钮）：只验证点击通路，不动提醒状态。
+        # 开了二次确认时再弹一条带「确认不再提醒 / 取消确认」的测试消息，
+        # 让用户能把第二步也点一遍（两个按钮都只回提示，不碰真实提醒）。
+        if isinstance(data, dict) and str(data.get("test") or "") == "ack":
+            event.stop_event()
+            if self.urgent_dm.ack_button_confirm:
+                await self.delivery.send_ack_prompt(
+                    self._self_private_umo(event),
+                    "（测试）第一步通了。想验第二步就随便点下面一个按钮：\n"
+                    "「确认不再提醒」和「取消确认」都只会回你一句提示，"
+                    "不会动任何真实提醒。",
+                    self.message_settings,
+                    data=ACK_BUTTON_TEST_DATA,
+                )
+                return
+            yield event.plain_result(
+                "✅ 按钮点击通路正常：一次点击就回调了，AstrBot 在交给插件之前"
+                "已经做过 ack，所以不会卡 loading。"
+            )
+            return
+
+        if not self.urgent_dm.enabled:
+            return
+
+        self_umo = self._self_private_umo(event)
+        if self.urgent_dm.ack_button_confirm:
+            # 二次确认：这一步只发确认消息，不动提醒状态
+            event.stop_event()
+            await self.delivery.send_ack_prompt(
+                self_umo,
+                "要停掉这轮提醒就点「确认不再提醒」，\n"
+                "不想停就点「取消确认」，之后照常催你。",
+                self.message_settings,
+            )
+            return
+
+        acked, ack_all = await self._ack_now(self_umo, ())
+        event.stop_event()
+        if not acked:
+            yield event.plain_result("这条提醒已经确认过了，不会再催你。")
+            return
+        yield event.plain_result(self._ack_reply(acked, ack_all=ack_all))
+
+    @filter.button_action(ACK_CANCEL_BUTTON_ID)
+    async def cancel_ack_by_button(self, event: AstrMessageEvent):
+        """二次确认里的反悔按钮：不做任何确认，下一轮该催还催。"""
+        if not self.urgent_dm.enabled:
+            return
+        event.stop_event()
+        if self._is_test_button(self._button_data(event)):
+            yield event.plain_result(
+                "✅ 按钮点击通路正常（点的是「取消确认」）：没有动任何提醒状态。"
+            )
+            return
+        yield event.plain_result(
+            "好，继续提醒。想停的时候再点一次「我已知晓」→「确认不再提醒」就行。"
+        )
+
+    @filter.button_action(ACK_CONFIRM_BUTTON_ID)
+    async def confirm_ack_by_button(self, event: AstrMessageEvent):
+        """二次确认按钮：走到这里才真正停掉本轮提醒。"""
+        if not self.urgent_dm.enabled:
+            return
+        if self._is_test_button(self._button_data(event)):
+            event.stop_event()
+            yield event.plain_result(
+                "✅ 按钮点击通路正常（点的是「确认不再提醒」）：没有动任何提醒状态。"
+            )
+            return
+        acked, ack_all = await self._ack_now(self._self_private_umo(event), ())
+        event.stop_event()
+        if not acked:
+            yield event.plain_result("这轮提醒已经确认过了，不会再催你。")
+            return
+        yield event.plain_result(self._ack_reply(acked, ack_all=ack_all))
+
+    # action_id=None = 接住所有按钮点击：一行里每个按钮的 id 必须唯一（QQ 适配器
+    # 会校验），没法像「我已知晓」那样共用一个固定 id，所以在这里按 data 里的
+    # detail 字段分流；不是详情按钮就直接返回，不 stop_event，别的处理器照常接。
+    @filter.button_action()
+    async def detail_by_button(self, event: AstrMessageEvent):
+        """摘要提醒里的「看详情」按钮（QQ 官方机器人）。
+
+        摘要只写「几个活动要结束了」，具体是哪些活动靠按钮的 data 指路。这里
+        点击时现查而不是把内容塞进摘要：旧消息上的按钮可能已经过时（活动结束
+        了、或者早就确认过），查不到就直说，不发过期内容。
+        """
+        if not self.urgent_dm.enabled:
+            return
+        raw = self._button_data(event)
+        if not isinstance(raw, dict):
+            return
+        game_id = str(raw.get("detail") or "").strip()
+        if not game_id:
+            return
+        event.stop_event()
+
+        now = datetime.now(GAME_TIMEZONE)
+        private_umo = self._self_private_umo(event)
+        current_umo = str(getattr(event, "unified_msg_origin", "") or "")
+        if self.urgent_dm.detail_target == "private":
+            umo = private_umo or current_umo
+        else:
+            umo = current_umo or private_umo
+        # 私聊发不出去（没私聊过 bot、openid 拿不到）时回落到点击所在的会话，
+        # 别让用户点半天没反应。
+        fallback_umo = (
+            current_umo if umo == private_umo and current_umo != private_umo else ""
+        )
+        test = str(raw.get("test") or "") == "detail"
+
+        if test:
+            picks = (
+                [self.registry.get(game_id)]
+                if game_id != DETAIL_ALL
+                else self.registry.ordered()[:3]
+            )
+            games = [game for game in picks if game is not None]
+            activities = simulate_urgent_activities(
+                games, now, len(games), per_game=1
+            )
+            if not activities:
+                yield event.plain_result("（测试）没能造出示例活动，检查下数据源开关。")
+                return
+        else:
+            data = await self.subscriptions.get_urgent_dm()
+            batch = SubscriptionService.latest_batch(data, private_umo)
+            wanted: dict[str, set[str]] = {}
+            for uid in batch:
+                gid = uid.split("|", 1)[0]
+                if game_id not in (DETAIL_ALL, gid):
+                    continue
+                wanted.setdefault(gid, set()).add(uid)
+            if not wanted:
+                yield event.plain_result(
+                    "这条提醒已经处理过了，现在没有需要看详情的活动。"
+                )
+                return
+            activities = []
+            missed: list[str] = []
+            for gid, uids in wanted.items():
+                try:
+                    fetched = await self.polling.fetch_activities(gid)
+                except Exception as exc:
+                    missed.append(gid)
+                    logger.warning(f"查看 {gid} 活动详情失败: {exc}")
+                    continue
+                activities.extend(item for item in fetched if item.uid in uids)
+            if not activities:
+                yield event.plain_result(
+                    "这些活动已经结束了，不用再催了。"
+                    if not missed
+                    else "活动数据暂时取不到，稍后再点一次试试。"
+                )
+                return
+
+        settings = self.message_settings
+        style = self.delivery.message_style(umo, settings)
+        with_button = bool(
+            self.urgent_dm.ack_button and self.delivery.supports_button(umo)
+        )
+        hint = (
+            "（点下面的「我已知晓」就停掉这轮）"
+            if with_button
+            else "（回一句「/我已知晓」就不会再催你了）"
+        )
+        by_game: dict[str, list] = {}
+        for item in activities:
+            by_game.setdefault(item.game_id, []).append(item)
+        sent = False
+        for items in by_game.values():
+            parts = build_urgent_dm_parts(
+                items,
+                now,
+                settings,
+                ack_hint=hint,
+                games=self.registry.games,
+                style=style,
+            )
+            if not parts:
+                continue
+            ok = False
+            for target in (umo, fallback_umo):
+                if not target:
+                    continue
+                ok = await self.delivery.send_parts(
+                    target,
+                    parts,
+                    replace(settings, use_forward_node=False),
+                    node_name=settings.forward_node_name,
+                    ack_button=with_button,
+                )
+                if ok:
+                    if target != umo:
+                        logger.info(
+                            f"详情私聊发不出去，已回落到当前会话 {target} 发送"
+                        )
+                    break
+            sent = sent or ok
+        if not sent:
+            yield event.plain_result(
+                "❌ 详情消息发送失败，稍后再点一次。"
+                + certification_tip(self.urgent_dm.certification)
+            )
+            return
+        if test:
+            yield event.plain_result(
+                "✅ 详情按钮通了：上面这条就是真有提醒时点「看详情」会发出的内容"
+                "（示例数据）。"
+            )
+
     async def _ack_now(
         self, umo: str, scope: Sequence[str]
     ) -> tuple[list[str], bool]:
@@ -1298,6 +1738,23 @@ class GameActivityPlugin(Star):
         return (acked, ack_all)
 
     @staticmethod
+    def _button_data(event: AstrMessageEvent) -> Any:
+        """取这次按钮点击带回的回调数据；平台/版本不提供时返回 None。"""
+        getter = getattr(event, "get_button_interaction", None)
+        if not callable(getter):
+            return None
+        try:
+            interaction = getter()
+        except Exception:  # pragma: no cover - 取决于 AstrBot 版本
+            return None
+        return getattr(interaction, "data", None)
+
+    @staticmethod
+    def _is_test_button(data: Any) -> bool:
+        """这次点击是不是「/活动私人提醒 测试 按钮」发出来的测试消息。"""
+        return isinstance(data, dict) and str(data.get("test") or "") == "ack"
+
+    @staticmethod
     def _ack_reply(acked: Sequence[str], *, ack_all: bool = False) -> str:
         names = "、".join(acked[:6])
         extra = "" if len(acked) <= 6 else f" 等 {len(acked)} 个活动"
@@ -1329,6 +1786,72 @@ class GameActivityPlugin(Star):
                 tokens.append(chunk)
         return tuple(tokens)
 
+    async def _send_detail_test(self, umo: str) -> str:
+        """给「/活动私人提醒 测试 详情」造一条带详情按钮的摘要私聊。
+
+        用内置示例活动（不联网、不读真实提醒状态），按钮里带 test 标记，
+        点了只会回一句「通了」，不会动任何真实提醒。
+        """
+        now = datetime.now(GAME_TIMEZONE)
+        # 故意多挑几个，好让测试消息直接展示「按钮换行」的效果
+        picked = self.registry.ordered()[: min(6, DETAIL_MAX_BUTTONS)]
+        activities = simulate_urgent_activities(
+            picked, now, len(picked), per_game=1
+        )
+        if not activities:
+            return "❌ 没能造出示例活动，检查下数据源开关。"
+        settings = self.message_settings
+        style = self.delivery.message_style(umo, settings)
+        parts = build_urgent_dm_summary_parts(
+            activities,
+            now,
+            settings,
+            games=self.registry.games,
+            ack_hint="（测试消息：点按钮才发详情；「我已知晓」也不会停掉真实提醒）",
+            style=style,
+        )
+        groups = build_urgent_dm_groups(
+            activities, now, settings, games=self.registry.games
+        )
+        entries = [
+            (group.short, {"detail": group.game_id, "test": "detail"})
+            for group in groups[:DETAIL_MAX_BUTTONS]
+        ]
+        rows = self.delivery.build_detail_rows(
+            entries,
+            all_entry=(DETAIL_ALL_LABEL, {"detail": DETAIL_ALL, "test": "detail"}),
+        )
+        ok = await self.delivery.send_parts(
+            umo,
+            parts,
+            replace(settings, use_forward_node=False),
+            node_name=settings.forward_node_name,
+            ack_button=True,
+            ack_data=ACK_BUTTON_TEST_DATA,
+            extra_rows=rows,
+        )
+        if not ok:
+            return (
+                "❌ 测试消息发送失败，请确认适配器支持主动私聊。"
+                + certification_tip(self.urgent_dm.certification)
+            )
+
+        return (
+            f"✅ 摘要测试消息已发到你的私聊（{umo}），去私聊看看。\n"
+            "点「看详情」会弹出示例活动的详细，点「我已知晓」只会回一句提示。"
+        )
+
+    @staticmethod
+    def _event_sender_id(event: AstrMessageEvent) -> str:
+        """取执行者在当前平台的用户标识（QQ 官方是 openid，OneBot 是 QQ 号）。"""
+        getter = getattr(event, "get_sender_id", None)
+        if not callable(getter):
+            return ""
+        try:
+            return str(getter() or "").strip()
+        except Exception:  # pragma: no cover - 取决于 AstrBot 版本
+            return ""
+
     @staticmethod
     def _self_private_umo(event: AstrMessageEvent) -> str:
         """执行者自己的私聊会话。
@@ -1339,16 +1862,23 @@ class GameActivityPlugin(Star):
         """
         umo = event.unified_msg_origin
         platform = umo.split(":", 1)[0] if ":" in umo else ""
-        sender = ""
-        getter = getattr(event, "get_sender_id", None)
-        if callable(getter):
-            try:
-                sender = str(getter() or "").strip()
-            except Exception:  # pragma: no cover - 取决于 AstrBot 版本
-                sender = ""
+        sender = GameActivityPlugin._event_sender_id(event)
         if platform and sender:
             return f"{platform}:FriendMessage:{sender}"
         return umo
+
+    async def _issue_bind_code(self, source: str, sender: str) -> str:
+        """生成一个群内/会话内私有的一次性绑定码，供用户去私聊里认领。"""
+        now = datetime.now(GAME_TIMEZONE)
+        codes = await self.subscriptions.get_bind_codes()
+        code = SubscriptionService.create_bind_code(
+            codes,
+            source=source,
+            sender=sender,
+            now=now,
+        )
+        await self.subscriptions.save_bind_codes(codes)
+        return code
 
     @staticmethod
     def _event_is_admin(event: AstrMessageEvent) -> bool:
@@ -1369,8 +1899,18 @@ class GameActivityPlugin(Star):
         return not any("\u4e00" <= char <= "\u9fff" for char in str(token))
 
     @staticmethod
-    def _mention_targets(event: AstrMessageEvent, umo: str) -> list[str]:
-        """把消息里 @ 到的 QQ 号拼成完整 UMO（主动私聊只能靠它定位）。"""
+    def _mention_targets(
+        event: AstrMessageEvent,
+        umo: str,
+        *,
+        self_umo: str = "",
+        self_sender: str = "",
+    ) -> list[str]:
+        """把消息里 @ 到的 QQ 号拼成完整 UMO（主动私聊只能靠它定位）。
+
+        @ 到自己时直接用 self_umo：群里拿到的 openid 与私聊 openid 未必通用，
+        换成「执行者自己的私聊会话」才发得出去。
+        """
         platform = umo.split(":", 1)[0] if ":" in umo else ""
         if not platform:
             return []
@@ -1382,8 +1922,13 @@ class GameActivityPlugin(Star):
             if qq is None:
                 continue
             text = str(qq).strip()
-            target = f"{platform}:FriendMessage:{text}"
-            if text and target not in targets:
+            if not text:
+                continue
+            if self_umo and self_sender and text == self_sender:
+                target = self_umo
+            else:
+                target = f"{platform}:FriendMessage:{text}"
+            if target not in targets:
                 targets.append(target)
         return targets
 

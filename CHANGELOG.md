@@ -1,5 +1,167 @@
 # 更新日志
 
+## 1.6.0
+
+QQ 官方机器人（`qq_official`）一条消息只能有一个 `msg_type`、只认一张图，图文混排会被
+拆成好几条发出去。新增的 Markdown 排版让整条提醒待在同一个气泡里；封面默认只内嵌
+第一张，免得一条消息塞满图被平台截断。管理页的模板编辑器跟着改了：只画当前平台
+真实会发的那一种，排版方式和预览平台都记住上次的选择，点弹窗外的空白也不会再关窗。
+
+> 唉唉唉唉唉唉唉唉唉唉唉唉唉唉唉  官bot  唉唉唉唉唉唉唉唉唉唉唉唉唉唉唉
+
+### 新增
+
+- **Markdown 排版**：`message_format.markdown_mode`（默认 `auto`）——
+  `auto` 时 QQ 官方机器人（`qq_official`、`qq_official_webhook`）用 Markdown 排版，
+  其它平台保持纯文本 / 图片 / 合并转发；`on` 强制所有平台；`off` 关闭。
+  标题用 `##`、活动标题加粗、`***` 分界、封面与详情写成 `[封面图](url)` / `[详情](url)`，
+  行尾用两个空格做硬换行。
+- **平台能力判断**：`delivery_service` 新增 `MARKDOWN_PLATFORMS`、`supports_markdown()`、
+  `message_style()`，以及 `_can_forward()`——Markdown 生效时自动不用合并转发
+  （两者混用会把 `**` 原样塞进转发节点）。
+- **平台类型按适配器反查**：UMO 第一段是**平台 id**（配置里给适配器起的名字，
+  比如 `Fairy`、`Ponderer`），不是 `qq_official` / `aiocqhttp` 这种类型名，之前拿它
+  直接比较，只要用户改过 id，Markdown、按钮、合并转发就全都判成「平台不支持」。
+  新增 `platform_type(umo)`：用 `context.platform_manager.get_insts()` 的
+  `meta().id` → `meta().name` 反查，查不到才退回按原样比较。
+- **「我已知晓」按钮**：`delivery_service` 新增 `BUTTON_PLATFORMS`、`supports_button()`、
+  `build_ack_row()`，`send_parts(ack_button=)` 在消息末尾追加 `ActionRow`；
+  `main.py` 新增 `ack_by_button` 处理器（按 `ACK_BUTTON_ID` 认领点击并复用 `_ack_now`）。
+  按钮事件只会被带 `ButtonActionFilter` 的 handler 接住（`waking_check` 阶段会把其它
+  handler 全部跳过），所以这里用 `@filter.button_action(...)` 而不是 `event_message_type`。
+  点一次就完成确认：AstrBot 在把事件交给插件之前已经 ack 掉这次 interaction。
+- **按钮点击后的二次确认**：`urgent_dm.ack_button_confirm`（默认开）。开启后第一下
+  「我已知晓」不会立刻停提醒，而是发一条消息，里面同一行并排两个按钮：
+  红色「确认不再提醒」（`ACK_CONFIRM_BUTTON_ID`，按下由 `confirm_ack_by_button` 走
+  `_ack_now` 真正停掉）和灰色「取消确认」（`ACK_CANCEL_BUTTON_ID`，由
+  `cancel_ack_by_button` 接住，不动任何状态、之后照常催）。两个按钮来自
+  `build_ack_row(confirm=True)` / `send_ack_prompt()`。
+  QQ 官方没有「更新已发消息按钮」的接口（文档只给了发送时带 `keyboard` 与
+  `PUT /interactions/{id}` 回应），所以这一行按钮在新消息里，做不到原地改字。
+- **按钮测试指令**：`/活动私人提醒 测试 按钮` 给自己发一条带按钮的测试私聊，
+  点一下会回「按钮点击通路正常」；回调数据带 `ACK_BUTTON_TEST_DATA`，
+  只验证通路、不动任何提醒状态（`build_ack_row(data=)` / `send_parts(ack_data=)`）。
+  开了 `ack_button_confirm` 时，测试按钮点完还会再弹一条带
+  「确认不再提醒 / 取消确认」的测试消息（`send_ack_prompt(..., data=ACK_BUTTON_TEST_DATA)`），
+  两个按钮各有自己的 handler、都只回一句提示，由 `main._is_test_button()` 判定。
+- **模板编辑器**：新增「排版方式」下拉，右栏直接用真正发送时的那套渲染
+  （`template_preview` 增加 `markdown.text` 与 `urgent.markdown_lines`）。
+- **预览只画一种**：右栏不再把「普通消息 / 合并转发 / Markdown」三栏一起画，改成
+  按平台只画实际会发的那一种。`/api/plugin/.../template` 新增 `preview_platforms`
+  （从订阅与私聊提醒目标里收集），`template_preview` 新增 `style` / `platform` /
+  `platforms` / `forward_enabled`；「预览平台」下拉从左栏挪到了标题栏右侧，
+  与「排版方式」（`markdown_mode`）并排：只接一个平台时「自动」就用它，接多个
+  平台时可手动切；「普通消息」和「合并转发」按 `use_forward_node` 二选一，仍算同一种。
+- **Markdown 内嵌封面**：Markdown 模式下 `cover_mode = image` 不再只给「封面图」链接，
+  改成 `![封面图](地址)` 真嵌图（只有公网 `http(s)` 封面才嵌，本地路径自动退回链接；
+  `cover_mode = link` 仍只给链接）。模板编辑器的预览也认得这种语法，选具体游戏就能
+  看到真实封面。
+- **Markdown 内嵌封面上限**：官方文档没写 Markdown 长度上限，六个活动各带一张内嵌图时
+  真机很可能被截断或静默丢图。新增 `message_format.markdown_cover_limit`（默认 1，
+  0 = 一张都不嵌，最大 20）：`message_formatter` 新增 `MarkdownCoverBudget` 与
+  `normalize_markdown_cover_limit()`，按发送顺序发放配额，超出配额的封面退回
+  `[封面图](链接)`；单条提醒、订阅概览、紧急私聊各自共用一份预算，
+  转发节点（每块独立一条消息）不受影响。
+- 新增 `tests/test_markdown_render.py`（15 个用例）：链接转义、无图片片段、`***` 分隔、
+  `normalize_markdown_mode` 各种取值、按平台选排版、Markdown 下禁止转发、内嵌封面与回退、
+  封面配额（默认只嵌第一张 / 0 张 / 调大 / 越界夹紧）。
+- **「我已知晓」按钮**：紧急私聊提醒末尾挂一个可点按钮（`urgent_dm.ack_button`，默认开），
+  点一下就等于回了 `/我已知晓`，不用打字。只在 QQ 官方机器人（`qq_official` /
+  `qq_official_webhook`）发送——AstrBot 在分发事件前已经 ack 掉 interaction，
+  **点一次就完成确认**，不存在“点两遍”。onebot 系能不能显示按钮取决于协议端实现，
+  所以不发送，仍用文字提示。新增 `tests/test_ack_button.py`（14 个用例）。
+- **摘要 + 看详情按钮**：官方机器人用不了合并转发，一次到期六个活动就是六条长消息，
+  很容易被划过去。同时要结束的活动 ≥ `urgent_dm.detail_min`（默认 3，最小 2）时，
+  改发一条摘要（`🚨 6 个活动马上就要结束了！` / `🚨 铁:2 | 原:2 | 绝:2` / `最急：…`），
+  下面挂按钮：每个游戏一个 + 一个「全部」。游戏多的时候自动换行——QQ 允许 5 行 × 5 个，
+  所以 `DETAIL_BUTTONS_PER_ROW`=5、`DETAIL_ROWS_MAX`=5，`DETAIL_MAX_BUTTONS`=24
+  （留一格给「全部」），装不下的游戏只能点「全部」。`delivery_service` 新增
+  `DETAIL_BUTTON_ID`（所有按钮共用同一个 action id 前缀——`ButtonActionFilter`
+  只认精确匹配，具体游戏只能塞进 `CallbackAction.data`；实际 id 带序号后缀保证唯一）、
+  `DETAIL_ALL` / `DETAIL_ALL_LABEL`、`build_detail_rows()`（旧单行版 `build_detail_row()`
+  保留）；`message_formatter` 新增
+  `build_urgent_dm_summary_parts()` / `build_urgent_dm_groups()`（活动已按剩余时间升序，
+  游戏按最急排序，摘要里不列活动名）。
+- **详情按钮处理器**：`main.py` 新增 `detail_by_button`。点下去时**现查**：
+  先取 `SubscriptionService.latest_batch()`（最近一轮送达、未被确认的活动），
+  再只对涉及的游戏 `fetch_activities()` 拿回完整排版（封面、说明都靠它），
+  按游戏分批发 `build_urgent_dm_parts()`。活动已结束 / 已确认 / 取不到数据各有一句人话回执，
+  不会翻出过期活动。详情**默认发到点按钮那个人的私聊**，`urgent_dm.detail_target=auto`
+  才是「在哪点发哪」；私聊发不出去（没聊过机器人、对方把机器人删了）时自动回落到
+  点击所在的会话，不会白点。
+- **测试指令**：`/活动私人提醒 测试 详情` 发一条示例摘要 + 按钮，点哪个都只回示例活动
+  （回调数据带 `{"test": "detail"}`），不动真实提醒状态；配套 `USAGE_URGENT_DM` 两行用法。
+- **extra_rows 也按平台过滤**：`send_parts(extra_rows=)` 原先不受 `supports_button` 约束，
+  OneBot 平台会把 `ActionRow` 当未知组件塞进消息；现在不支持按钮的平台连额外按钮行也一起跳过。
+- 新增 `tests/test_detail_button.py`（21 个用例）：按钮行顺序 / 截断 / 回调数据、
+  多行换行（6 个游戏 → `[5, 2]`）与 5 行上限、`detail_target` 默认 `private` 与兜底、
+  `ActionRow` 在摘要里排在 ack 行之前且 OneBot 上被丢弃、`latest_batch` 只取最近一轮、
+  摘要文案与 Markdown 标题、轮询层「≥ detail_min 转摘要 / 少于则发详细 / 关掉配置发详细 /
+  无按钮平台不发摘要」。
+- **模板编辑器也画摘要和按钮**：紧急提醒预览（只画当前平台那一种）在「活动数 ≥ `detail_min`」时
+  改画真正会发出去的那条摘要（`## 🚨 6 个活动马上就要结束了！` + 游戏分布 + 最急），
+  下面按 QQ inline keyboard 的样子画一排假按钮（每个游戏一个 + 「全部」，再加一个蓝色的
+  「我已知晓」）。`template_preview` 的 `build_urgent_preview()` 新增 `detail_min` /
+  `ack_button` / `max_buttons` / `all_label` / `ack_label` 参数与返回字段
+  `summary_lines` / `detail_buttons` / `ack_label`，前端新增 `renderFakeKeyboard()` 与
+  `.qq-keyboard` / `.qq-key` 样式；关掉按钮配置时预览退回逐条详情，与线上一致。
+
+- **官方机器人也能加自己了（加入 / 绑定码）**：QQ 官方机器人一般加不上好友，没聊过天
+  它就发不出主动私聊，`/活动私人提醒` 不带参数在群里执行只会写进一条发不出去的记录。
+  现在两条路：私聊里发 `/活动私人提醒 加入`（或直接聊过它之后再在群里发）就把自己的
+  私聊会话写进目标；群里发 `/活动私人提醒 绑定` 拿一个 6 位码（`BIND_CODE_KEY`，
+  15 分钟有效、只认第一次、最多同时存在 `MAX_BIND_CODES`=50 个），再去私聊发
+  `/活动私人提醒 绑定 123456` 认领。`SubscriptionService` 新增 `create_bind_code()` /
+  `consume_bind_code()` / `get_bind_codes()` / `save_bind_codes()`，确认成功后会顺手清掉
+  那条 `{平台}:FriendMessage:{群成员标识}` 的临时记录（openid 跨场景复用没有官方承诺）。
+- **群里 @自己 不再被当成别人**：权限判定原先拿目标跟当前会话来比，群里 @ 自己时目标
+  是执行者的私聊会话号，于是非管理员被误判成「只有管理员可以…」。现在三个分支统一用
+  `target not in (umo, self_umo)`。
+- **官方机器人拒绝「替别人开通」**：拿不到别人的 openid，`@某人` + 加入只会写出一条发不
+  出去的记录，现在直接回一句让对方自己发 `/活动私人提醒 加入` 或去拿绑定码。
+- 新增 `tests/test_subscription_service.py` 9 个用例：码格式与写入、过期/已用清理、
+  满额丢最旧、只认一次、复制返回、自定义 TTL、KV 往返、脏数据忽略。
+- **认证类型可选（个人 / 企业）**：QQ 开放平台的接口不返回机器人是个人认证还是企业认证，
+  而**个人认证的机器人加不了好友**，必须先由创建者在「开发体验号码设置」里把使用者的
+  QQ 号加进体验成员（最多 20 个），私聊窗口才打得开。新增 `urgent_dm.certification`
+  （`unknown` / `personal` / `enterprise`），只影响「主动私聊发不出去」时给哪条提示：
+  `urgent_dm_service` 新增 `parse_certification()` / `normalize_certification()` /
+  `private_dm_blocked_hint()` / `certification_tip()`，`/活动私人提醒 加入` 发不出去时
+  按认证类型给对应步骤（个人认证点明体验成员与 20 个上限，企业认证点明直接私聊），
+  测试 / 详情发送失败的提示后面也追加一行认证小提示；绑定码照旧附带。
+- **排版方式改完立刻存盘**：标题栏的「排版」下拉原先只改草稿，必须点「保存模板」才落地，
+  关掉编辑器就回到旧值。新增接口 `markdown-mode-save`（只写 `message_format.markdown_mode`
+  一个键、校验 `auto/on/off`、其它模板键原样保留、写完 `reload_message_settings()`）；
+  前端切下拉即提交，失败回退提示。「还原修改」会把这个键一起存回去，避免界面退回去了
+  配置还是新的。新增 `tests/test_activity_webui_markdown_mode.py`（5 个用例：路由注册、
+  写配置并保留其它键、大小写与空格归一、非法值 400 且不动配置、缺 `message_format` 块时创建）。
+- **「预览平台」记住上次的选择**：这个下拉只影响编辑器右栏画哪一种，不写插件配置，
+  存放在本机浏览器 `localStorage`（`gameEventDue.previewPlatform`）；打开模板编辑器时读回，
+  不在当前可选平台里就退回「自动」。隐私模式 / 禁用存储时静默忽略。
+- **管理页标题栏的「认证」下拉**：接口 `certification-save`，保存后同时写回
+  `urgent_dm.certification` 与运行中的 `urgent_dm` 设置，不用重启；格式不对回 400。
+- 新增 `tests/test_activity_webui_certification.py`（5 个用例：路由注册、写配置并保留其它键、
+  英文取值、非法取值 400 且不改配置、配置里没有 `urgent_dm` 块时自动创建），
+  `tests/test_urgent_dm_service.py` 追加 7 个用例（别名解析、兜底、三种提示文案、
+  TTL 下限、`certification_tip` 只对两种已知类型返回非空）。
+### 修复
+
+- **点管理页弹窗的空白处不再关窗**：三个弹窗（消息模板、数据源、私人提醒）原先都挂了一条
+  「点到遮罩就关闭」的监听，点旁边空白误关不说，拖选配置里的文字时鼠标划出弹窗、松手
+  也算一次 click，选到一半窗口就没了。现在只认右上角 ×，点遮罩没有任何响应。
+- **挂着按钮时不再教人回 `/我已知晓`**：摘要最后那句「（回一句 `/我已知晓` 就不会再催你了）」
+  在按钮已经画出来的平台上是废话，Markdown 下还多占一行。现在按能力分文案：
+  有按钮时是「（点下面的游戏按钮看详细；点「我已知晓」就停掉这轮）」，
+  逐条提醒是「（点下面的「我已知晓」就停掉这轮）」，没有按钮的平台才保留原来那句。
+  改在 `polling_service._urgent_ack_hint()`，摘要与逐条详情共用同一份判断。
+- **`/活动私人提醒 测试 详情` 发不出去**：详情按钮原先一行共用同一个 `DETAIL_BUTTON_ID`，
+  而 QQ 适配器要求同一份 keyboard 里的按钮 id 唯一（`qqofficial_message_event.py:1055`
+  `raise ValueError("QQ inline keyboard button IDs must be non-empty and unique.")`），
+  第二个按钮就抛异常，整条消息发不出去、只在外面看到「测试消息发送失败」。
+  现在 `build_detail_row()` 给每个按钮 `f"{DETAIL_BUTTON_ID}_{index}"`，处理器改用
+  `@filter.button_action()`（匹配所有按钮）再靠回调 `data` 里的 `detail` 字段区分，
+  不是详情点击就原样放行给别的 handler。
+
 ## 1.5.0
 
 换群、换机器人之后订阅不用重配了；换到 QQ 官方机器人也不会再丢消息。

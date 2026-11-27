@@ -11,6 +11,8 @@ from astrbot_plugin_game_event_due.services.reminder_service import (
     ReminderPolicy,
 )
 from astrbot_plugin_game_event_due.services.subscription_service import (
+    BIND_CODE_KEY,
+    MAX_BIND_CODES,
     SubscriptionService,
     normalize_session,
     resolve_policy,
@@ -405,3 +407,131 @@ async def test_migrate_urgent_target_merges_progress():
     # 目标已有进度优先
     assert merged["activities"]["sr|a1"]["sent_total"] == 9
     assert merged["activities"]["ww|b1"]["sent_total"] == 1
+
+
+def test_create_bind_code_is_six_digits_and_stored():
+    data: dict = {}
+    code = SubscriptionService.create_bind_code(
+        data, source=UMO, sender="sender-1", now=NOW
+    )
+    assert len(code) == 6 and code.isdigit()
+    entry = data[code]
+    assert entry["source"] == UMO
+    assert entry["sender"] == "sender-1"
+    assert entry["used"] is False
+    assert entry["created"] == NOW.isoformat()
+    assert entry["expires"] == (NOW + timedelta(minutes=15)).isoformat()
+
+
+def test_create_bind_code_drops_expired_and_used_entries():
+    data: dict = {}
+    old = SubscriptionService.create_bind_code(
+        data, source=UMO, sender="a", now=NOW - timedelta(minutes=30)
+    )
+    used = SubscriptionService.create_bind_code(
+        data, source=UMO, sender="b", now=NOW
+    )
+    data[used]["used"] = True
+
+    fresh = SubscriptionService.create_bind_code(
+        data, source=UMO, sender="c", now=NOW
+    )
+
+    assert old not in data
+    assert used not in data
+    assert fresh in data
+    assert len(data) == 1
+
+
+def test_create_bind_code_trims_oldest_when_full():
+    data: dict = {}
+    first = SubscriptionService.create_bind_code(
+        data, source=UMO, sender="a", now=NOW
+    )
+    for index in range(MAX_BIND_CODES - 1):
+        SubscriptionService.create_bind_code(
+            data, source=UMO, sender=f"s{index}", now=NOW
+        )
+    assert len(data) == MAX_BIND_CODES
+
+    SubscriptionService.create_bind_code(data, source=UMO, sender="x", now=NOW)
+
+    assert len(data) == MAX_BIND_CODES
+    assert first not in data
+
+
+def test_consume_bind_code_marks_used_and_returns_copy():
+    data: dict = {}
+    code = SubscriptionService.create_bind_code(
+        data, source=UMO, sender="sender-1", now=NOW
+    )
+
+    entry = SubscriptionService.consume_bind_code(data, code, NOW)
+
+    assert entry is not None
+    assert entry["source"] == UMO
+    assert entry["used"] is True
+    assert data[code]["used"] is True
+    entry["source"] = "tampered"
+    assert data[code]["source"] == UMO
+    # 同一个码只认一次
+    assert SubscriptionService.consume_bind_code(data, code, NOW) is None
+
+
+def test_consume_bind_code_rejects_expired_and_unknown():
+    data: dict = {}
+    code = SubscriptionService.create_bind_code(
+        data, source=UMO, sender="sender-1", now=NOW, ttl_minutes=1
+    )
+
+    assert SubscriptionService.consume_bind_code(data, "000000", NOW) is None
+    assert SubscriptionService.consume_bind_code(data, "", NOW) is None
+    assert (
+        SubscriptionService.consume_bind_code(data, code, NOW + timedelta(minutes=2))
+        is None
+    )
+    assert code not in data
+
+
+def test_consume_bind_code_honours_custom_ttl():
+    data: dict = {}
+    code = SubscriptionService.create_bind_code(
+        data, source=UMO, sender="sender-1", now=NOW, ttl_minutes=1
+    )
+
+    assert SubscriptionService.consume_bind_code(
+        data, code, NOW + timedelta(seconds=30)
+    ) is not None
+
+
+@pytest.mark.anyio
+async def test_bind_codes_roundtrip_through_kv():
+    service, kv = make_service()
+    data: dict = {}
+    code = SubscriptionService.create_bind_code(
+        data, source=UMO, sender="sender-1", now=NOW
+    )
+    await service.save_bind_codes(data)
+
+    loaded = await service.get_bind_codes()
+
+    assert loaded == data
+    assert await service.get_bind_codes() == {
+        code: {
+            "source": UMO,
+            "sender": "sender-1",
+            "created": NOW.isoformat(),
+            "expires": (NOW + timedelta(minutes=15)).isoformat(),
+            "used": False,
+        }
+    }
+    assert kv.store
+
+
+@pytest.mark.anyio
+async def test_bind_codes_ignore_garbage_payload():
+    service, kv = make_service()
+    await kv.put(BIND_CODE_KEY, "not a dict")
+    assert await service.get_bind_codes() == {}
+    await kv.put(BIND_CODE_KEY, {"codes": {"123456": "nope", "": {"used": True}}})
+    assert await service.get_bind_codes() == {}

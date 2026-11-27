@@ -11,9 +11,17 @@ from typing import Any
 from astrbot.api import logger
 from astrbot.api.web import error_response, json_response, request
 
+from .services.delivery_service import (
+    ACK_BUTTON_LABEL,
+    DETAIL_ALL_LABEL,
+    DETAIL_ROW_LIMIT,
+)
 from .services.message_formatter import (
     COVER_MODES,
     DEFAULT_FORWARD_NODE_NAME,
+    MARKDOWN_COVER_LIMIT_MAX,
+    MARKDOWN_MODES,
+    STYLE_MARKDOWN,
     build_overview_message,
     normalize_game_aliases,
     normalize_game_short_names,
@@ -30,6 +38,11 @@ from .services.subscription_service import (
     SubscriptionService,
     resolve_message_settings,
     resolve_policy,
+)
+from .services.urgent_dm_service import (
+    CERTIFICATION_LABELS,
+    CERTIFICATIONS,
+    parse_certification,
 )
 from .services.urgent_dm_service import (
     MAX_DAILY_LIMIT,
@@ -72,12 +85,24 @@ class ActivityWebUIController:
             ("template", self.template, ["GET"], "读取消息模板配置"),
             ("template-preview", self.template_preview, ["POST"], "按草稿模板预览排版"),
             ("template-save", self.template_save, ["POST"], "保存消息模板配置"),
+            (
+                "markdown-mode-save",
+                self.markdown_mode_save,
+                ["POST"],
+                "只保存 Markdown 排版方式（改下拉即生效）",
+            ),
             ("refresh", self.refresh, ["POST"], "立即执行一轮活动检查"),
             ("settings", self.settings, ["GET"], "读取数据源与代理设置"),
             ("settings-save", self.settings_save, ["POST"], "保存数据源与代理设置"),
             ("urgent-targets", self.urgent_targets, ["GET"], "读取紧急私聊提醒配置"),
             ("urgent-save", self.urgent_save, ["POST"], "保存紧急私聊提醒配置"),
             ("urgent-migrate", self.migrate_urgent, ["POST"], "迁移紧急私聊提醒目标"),
+            (
+                "certification-save",
+                self.certification_save,
+                ["POST"],
+                "保存 QQ 官方机器人的认证类型",
+            ),
         )
         for endpoint, handler, methods, description in routes:
             self.context.register_web_api(
@@ -690,6 +715,52 @@ class ActivityWebUIController:
         await plugin.subscriptions.save_urgent_dm(data)
         return json_response(await self._build_urgent_overview())
 
+    async def certification_save(self):
+        """保存 QQ 官方机器人的认证类型（只影响私聊发不出去时的提示）。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求内容必须是 JSON 对象", status_code=400)
+        value = parse_certification(payload.get("certification"))
+        if value is None:
+            return error_response(
+                "认证类型只能是 unknown / personal / enterprise", status_code=400
+            )
+        block = dict(self.plugin.config.get("urgent_dm") or {})
+        block["certification"] = value
+        self.plugin.config["urgent_dm"] = block
+        try:
+            await self._save_plugin_config()
+        except Exception as exc:  # noqa: BLE001 - 保存失败要回前端而不是 500
+            logger.warning(f"保存认证类型失败: {exc}")
+            return error_response(f"保存失败：{exc}", status_code=500)
+        self.plugin.urgent_dm = replace(self.plugin.urgent_dm, certification=value)
+        return json_response(
+            {
+                "certification": value,
+                "label": CERTIFICATION_LABELS.get(value, value),
+            }
+        )
+
+    async def markdown_mode_save(self):
+        """切换「排版方式」下拉时立刻落盘，不必等「保存模板」。"""
+        payload = await request.json(default={})
+        if not isinstance(payload, dict):
+            return error_response("请求内容必须是 JSON 对象", status_code=400)
+        value = str(payload.get("markdown_mode") or "").strip().casefold()
+        if value not in MARKDOWN_MODES:
+            return error_response("排版方式只能是 auto / on / off", status_code=400)
+        block = self.plugin.config.get("message_format")
+        block = dict(block) if isinstance(block, dict) else {}
+        block["markdown_mode"] = value
+        self.plugin.config["message_format"] = block
+        try:
+            await self._save_plugin_config()
+        except Exception as exc:  # noqa: BLE001 - 保存失败要回前端而不是 500
+            logger.warning(f"保存排版方式失败: {exc}")
+            return error_response(f"保存失败：{exc}", status_code=500)
+        self.plugin.reload_message_settings()
+        return json_response({"markdown_mode": value})
+
     # ---- 消息模板编辑器 ----
 
     @staticmethod
@@ -707,11 +778,42 @@ class ActivityWebUIController:
             return default
         return str(values[key] if values[key] is not None else "").strip()
 
+    @staticmethod
+    def _read_int(
+        values: dict,
+        key: str,
+        default: int,
+        *,
+        minimum: int | None = None,
+        maximum: int | None = None,
+    ) -> int:
+        """读一个整数配置；写错了就用默认值，顺手夹到合法区间。"""
+        if key not in values:
+            return default
+        try:
+            number = int(str(values[key]).strip())
+        except (TypeError, ValueError):
+            return default
+        if minimum is not None and number < minimum:
+            number = minimum
+        if maximum is not None and number > maximum:
+            number = maximum
+        return number
+
     def _draft_settings(self, values: Any):
         """把页面提交的模板值套到当前设置上，得到一个用于预览的草稿。"""
         base = self.plugin.message_settings
         if not isinstance(values, dict) or not values:
             return base
+
+        markdown_mode = base.markdown_mode
+        if "markdown_mode" in values:
+            raw_md = str(values.get("markdown_mode") or "").strip().lower()
+            if raw_md not in MARKDOWN_MODES:
+                raise ValueError(
+                    f"排版方式只能是 {' / '.join(MARKDOWN_MODES)}"
+                )
+            markdown_mode = raw_md
 
         cover_mode = base.cover_mode
         if "cover_mode" in values:
@@ -757,6 +859,7 @@ class ActivityWebUIController:
             "activity_separator": self._read_text(
                 values, "activity_separator", base.activity_separator
             ),
+            "markdown_mode": markdown_mode,
             "include_description": self._read_bool(
                 values, "include_description", base.include_description
             ),
@@ -769,6 +872,13 @@ class ActivityWebUIController:
             "cover_mode": cover_mode,
             "image_mode_detail_link": self._read_bool(
                 values, "image_mode_detail_link", base.image_mode_detail_link
+            ),
+            "markdown_cover_limit": self._read_int(
+                values,
+                "markdown_cover_limit",
+                base.markdown_cover_limit,
+                minimum=0,
+                maximum=MARKDOWN_COVER_LIMIT_MAX,
             ),
         }
         return replace(base, **overrides)
@@ -835,16 +945,49 @@ class ActivityWebUIController:
             return
         raise RuntimeError("当前 AstrBot 版本不支持保存插件配置")
 
+    async def _subscribed_platforms(self) -> list[str]:
+        """列出当前有订阅或私聊提醒目标的平台。
+
+        模板预览是全局配置、没有会话上下文，只能按实际会收到推送的平台推断
+        该画哪种样式：一个平台就画它，多个平台交给用户在下拉里指定。
+        """
+        umos: list[str] = []
+        try:
+            sessions = await self.plugin.subscriptions.get_all()
+        except Exception as exc:
+            logger.warning(f"读取订阅会话失败，模板预览按纯文本处理: {exc}")
+            sessions = {}
+        if isinstance(sessions, Mapping):
+            umos.extend(str(key) for key in sessions)
+        try:
+            targets = await self.plugin.subscriptions.get_urgent_dm()
+        except Exception:
+            targets = {}
+        if isinstance(targets, Mapping):
+            umos.extend(str(key) for key in targets)
+
+        platforms: list[str] = []
+        for umo in umos:
+            prefix = umo.split(":", 1)[0].strip().casefold()
+            if prefix and prefix not in platforms:
+                platforms.append(prefix)
+        return platforms
+
     async def template(self):
         """返回模板编辑器需要的当前配置与可选游戏。"""
         return json_response(
             {
                 "values": self.plugin.message_format_values(),
+                "preview_platforms": await self._subscribed_platforms(),
                 "games": [
                     {"game_id": game.game_id, "name": game.name}
                     for game in self.plugin.registry.ordered()
                 ],
                 "cover_modes": list(COVER_MODES),
+                "markdown_modes": list(MARKDOWN_MODES),
+                "certification": self.plugin.urgent_dm.certification,
+                "certifications": list(CERTIFICATIONS),
+                "certification_labels": dict(CERTIFICATION_LABELS),
             }
         )
 
@@ -894,6 +1037,26 @@ class ActivityWebUIController:
             source_name=self.plugin.registry.source_name(game.game_id),
         )
         preview["note"] = note
+
+        # 只给前端一份「实际会发出去的那种」样式，避免普通 / 转发 / markdown 三栏一起画
+        requested = str(payload.get("preview_platform") or "auto").strip().casefold()
+        platforms = await self._subscribed_platforms()
+        if requested in ("", "auto"):
+            platform = platforms[0] if len(platforms) == 1 else ""
+        else:
+            platform = requested
+        umo = f"{platform}:GroupMessage:0" if platform else ""
+        style = self.plugin.delivery.message_style(umo, settings)
+        preview["style"] = style
+        preview["platform"] = platform
+        preview["platforms"] = platforms
+        preview["forward_enabled"] = bool(
+            style != STYLE_MARKDOWN
+            and settings.use_forward_node
+            and platform
+            and self.plugin.delivery.supports_forward(umo)
+        )
+
         try:
             urgent_count = int(payload.get("urgent_games", 3))
         except (TypeError, ValueError):
@@ -903,6 +1066,14 @@ class ActivityWebUIController:
             now,
             settings,
             count=urgent_count,
+            detail_min=self.plugin.urgent_dm.detail_min,
+            ack_button=(
+                self.plugin.urgent_dm.ack_button
+                and self.plugin.delivery.supports_button(umo)
+            ),
+            max_buttons=DETAIL_ROW_LIMIT,
+            all_label=DETAIL_ALL_LABEL,
+            ack_label=ACK_BUTTON_LABEL,
         )
         return json_response(preview)
 
@@ -934,11 +1105,13 @@ class ActivityWebUIController:
                 "headline_remaining": settings.headline_remaining,
                 "sort_by_urgency": settings.sort_by_urgency,
                 "activity_separator": settings.activity_separator,
+                "markdown_mode": settings.markdown_mode,
                 "include_description": settings.include_description,
                 "include_tags": settings.include_tags,
                 "include_extra_times": settings.include_extra_times,
                 "cover_mode": settings.cover_mode,
                 "image_mode_detail_link": settings.image_mode_detail_link,
+                "markdown_cover_limit": settings.markdown_cover_limit,
             }
         )
         self.plugin.config["message_format"] = block
