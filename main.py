@@ -62,7 +62,12 @@ from .services.template_preview import (
     simulate_urgent_activities,
 )
 from .services.polling_service import ActivityPollingService, PollingSettings
-from .services.reminder_service import ReminderPolicy, normalize_thresholds
+from .services.reminder_service import (
+    NEW_ACTIVITY_ON_START,
+    ReminderPolicy,
+    normalize_new_activity_timing,
+    normalize_thresholds,
+)
 from .services.subscription_service import (
     BIND_CODE_TTL_MINUTES,
     SubscriptionService,
@@ -239,6 +244,9 @@ class GameActivityPlugin(Star):
             ),
             remind_only_active=self._cfg_bool(
                 "reminder", "remind_only_active", True
+            ),
+            new_activity_timing=normalize_new_activity_timing(
+                self._cfg_str("reminder", "new_activity_timing", "preview")
             ),
         )
         self.message_settings = self._build_message_settings()
@@ -712,6 +720,13 @@ class GameActivityPlugin(Star):
         else:
             threshold_text = "已关闭"
         new_text = "开启" if policy.notify_new else "关闭"
+        if policy.notify_new:
+            timing = (
+                "开启当天通知"
+                if policy.new_activity_timing == NEW_ACTIVITY_ON_START
+                else "可预告通知"
+            )
+            new_text = f"开启（{timing}）"
         return f"倒计时提醒: {threshold_text}\n新活动提醒: {new_text}"
 
     @staticmethod

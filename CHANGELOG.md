@@ -1,5 +1,27 @@
 # 更新日志
 
+## 1.6.1
+
+预定了两个 issue。一个是 v1.5.0 把合并转发搞挂了的回归（平台 id 改过名就不认了），
+一个是 PRTS 提前挂预告导致“还没开始就推新活动”——顺手给了个开关，
+想让活动真开了再报就把 `new_activity_timing` 设成 `on_start`。
+
+### 新增
+
+- **新活动通知时机 `reminder.new_activity_timing`**（默认 `preview`）——
+  `preview` 可预告通知：活动进预告窗口就推，哪怕还没开始（数据源提前挂的预告也算）；
+  `on_start` 开启当天通知：等活动真正开始后才推，订阅那一刻还没开始的活动也会等活动开了再补推一次。
+  对应 `reminder_service.within_lookahead(..., on_start=)` 与
+  `SubscriptionService.build_initial_states` 的初始化逻辑。
+
+### 修复
+
+- **补一条合并转发的回归测试**：`tests/test_delivery_service.py` 新增
+  `test_supports_forward_looks_up_renamed_platform`，覆盖「平台 id 改过名
+  （如 `Ponderer`）但适配器仍是 `aiocqhttp`」的情况。原来的用例里 UMO 前缀恰好就叫
+  `aiocqhttp`，走的是退回分支，反查那段代码写坏了也测不出来；把 `platform_type()`
+  改回 1.5.0 的前缀比较，这条新用例会红。
+
 ## 1.6.0
 
 QQ 官方机器人（`qq_official`）一条消息只能有一个 `msg_type`、只认一张图，图文混排会被

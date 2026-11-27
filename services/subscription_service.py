@@ -22,6 +22,7 @@ from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from ..sources.base import Activity, GAME_TIMEZONE, parse_datetime
 from .message_formatter import COVER_MODES, MessageSettings
 from .reminder_service import (
+    NEW_ACTIVITY_ON_START,
     ActivityNotifyState,
     ReminderPolicy,
     current_tier,
@@ -616,6 +617,15 @@ class SubscriptionService:
             if activity.is_ended(now):
                 continue
             state = ActivityNotifyState(new_done=True)
+            # 「开启当天通知」模式下，订阅时还没开始的活动不算已知：等它真正
+            # 开启后再补推一次「新活动」，否则订阅那一刻就把未来的新活动吞掉了。
+            if (
+                policy.notify_new
+                and policy.new_activity_timing == NEW_ACTIVITY_ON_START
+                and activity.start_time is not None
+                and activity.start_time > now
+            ):
+                state.new_done = False
             if policy.countdown_enabled:
                 state.tier = current_tier(
                     activity.end_time,

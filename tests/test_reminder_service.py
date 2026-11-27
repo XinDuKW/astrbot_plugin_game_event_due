@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 import pytest
 
 from astrbot_plugin_game_event_due.services.reminder_service import (
+    NEW_ACTIVITY_ON_START,
+    NEW_ACTIVITY_PREVIEW,
     ActivityNotifyState,
     ReminderPolicy,
     apply_plan,
@@ -16,6 +18,7 @@ from astrbot_plugin_game_event_due.services.reminder_service import (
     is_more_urgent,
     matches_filters,
     normalize_keywords,
+    normalize_new_activity_timing,
     normalize_thresholds,
     reason_label,
 )
@@ -114,6 +117,23 @@ def test_normalize_thresholds(raw, expected):
     assert normalize_thresholds(raw) == expected
 
 
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (None, NEW_ACTIVITY_PREVIEW),
+        ("", NEW_ACTIVITY_PREVIEW),
+        ("preview", NEW_ACTIVITY_PREVIEW),
+        ("预告", NEW_ACTIVITY_PREVIEW),
+        ("on_start", NEW_ACTIVITY_ON_START),
+        (" on-start ", NEW_ACTIVITY_ON_START),
+        ("开启当天", NEW_ACTIVITY_ON_START),
+        ("乱写的", NEW_ACTIVITY_PREVIEW),
+    ],
+)
+def test_normalize_new_activity_timing(raw, expected):
+    assert normalize_new_activity_timing(raw) == expected
+
+
 def test_normalize_keywords_deduplicates_and_trims():
     assert normalize_keywords(" 双倍 , ,双倍,签到 ") == ["双倍", "签到"]
     assert normalize_keywords(None) == []
@@ -128,6 +148,38 @@ def test_new_activity_within_lookahead_is_reported():
     assert plan is not None
     assert plan.reasons == ("new",)
     assert plan.tier == ""
+    assert plan.is_new
+
+
+def test_new_activity_preview_still_pushes_unstarted_activity():
+    # 「可预告通知」：活动还没开始，只要在预告窗口里就先推一次
+    activity = make_activity(start=timedelta(days=5), end=timedelta(days=20))
+    plan = evaluate_activity(activity, NOW, None, POLICY)
+    assert plan is not None
+    assert plan.is_new
+
+
+def test_new_activity_on_start_skips_unstarted_activity():
+    # 「开启当天通知」：还没开始的活动不算新活动，等它开了再推
+    policy = ReminderPolicy(new_activity_timing=NEW_ACTIVITY_ON_START)
+    activity = make_activity(start=timedelta(days=5), end=timedelta(days=20))
+    assert evaluate_activity(activity, NOW, None, policy) is None
+
+
+def test_new_activity_on_start_fires_once_activity_starts():
+    policy = ReminderPolicy(new_activity_timing=NEW_ACTIVITY_ON_START)
+    activity = make_activity(start=timedelta(hours=-1), end=timedelta(days=20))
+    plan = evaluate_activity(activity, NOW, None, policy)
+    assert plan is not None
+    assert plan.is_new
+
+
+def test_new_activity_on_start_keeps_activity_without_start_time():
+    # 没有开始时间（常驻玩法之类）没法判断开没开，直接推
+    policy = ReminderPolicy(new_activity_timing=NEW_ACTIVITY_ON_START)
+    activity = make_activity(start=None, end=timedelta(days=20))
+    plan = evaluate_activity(activity, NOW, None, policy)
+    assert plan is not None
     assert plan.is_new
 
 

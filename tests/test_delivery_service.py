@@ -26,11 +26,44 @@ UMO = "aiocqhttp:FriendMessage:123456"
 ACK_HINT = "（回一句「/我已知晓」就不会再催你了）"
 
 
-class FakeContext:
-    """记录发送出去的会话与消息链。"""
+class FakeMeta:
+    """只带 id 与 name 的平台元信息，够 platform_type 反查用。"""
 
-    def __init__(self) -> None:
+    def __init__(self, platform_id: str, name: str) -> None:
+        self.id = platform_id
+        self.name = name
+
+
+class FakePlatform:
+    def __init__(self, platform_id: str, name: str) -> None:
+        self._meta = FakeMeta(platform_id, name)
+
+    def meta(self) -> FakeMeta:
+        return self._meta
+
+
+class FakePlatformManager:
+    def __init__(self, *platforms: FakePlatform) -> None:
+        self._insts = list(platforms)
+
+    def get_insts(self) -> list[FakePlatform]:
+        return self._insts
+
+
+class FakeContext:
+    """记录发送出去的会话与消息链。
+
+    传了平台实例才有 platform_manager，用来验证「按平台 id 反查适配器类型」；
+    不传时故意保持缺少该属性，让调用方走「按 UMO 前缀判断」的退回分支。
+    """
+
+    def __init__(self, *platforms: tuple[str, str]) -> None:
         self.sent: list[tuple[str, object]] = []
+        self.platform_manager = (
+            FakePlatformManager(*(FakePlatform(*item) for item in platforms))
+            if platforms
+            else None
+        )
 
     async def send_message(self, umo: str, chain: object) -> None:
         self.sent.append((umo, chain))
@@ -160,6 +193,24 @@ def test_send_parts_on_qq_official_never_builds_forward_nodes():
     assert ok is True
     _, chain = context.sent[0]
     assert all(isinstance(item, Comp.Plain) for item in chain.chain)
+
+
+def test_supports_forward_looks_up_renamed_platform():
+    """平台 id 叫 Ponderer、适配器还是 aiocqhttp 时，照样要认成支持转发。
+
+    1.5.0 的回归就发生在这里：那时只拿 UMO 前缀和 aiocqhttp 硬比，平台改过名
+    就一律判成不支持，合并转发被静默降级成普通消息。这条用例专门盯住反查路径，
+    前缀比较本身在下面的用例里单独覆盖。
+    """
+    context = FakeContext(("Ponderer", "aiocqhttp"), ("Fairy", "qq_official"))
+    service = ActivityDeliveryService(context, SETTINGS, resolver=None)
+    assert service.platform_type("Ponderer:GroupMessage:1") == "aiocqhttp"
+    assert service.supports_forward("Ponderer:GroupMessage:1") is True
+    assert service.platform_type("Fairy:FriendMessage:x") == "qq_official"
+    assert service.supports_forward("Fairy:FriendMessage:x") is False
+    assert service.supports_markdown("Fairy:FriendMessage:x") is True
+    # 适配器不在实例列表里（比如刚被删掉）时，退回按前缀原样判断
+    assert service.supports_forward("telegram:FriendMessage:1") is False
 
 
 def test_urgent_forward_without_groups_sends_nothing():

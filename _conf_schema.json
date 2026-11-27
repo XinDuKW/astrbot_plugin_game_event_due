@@ -146,6 +146,16 @@
         "default": 45,
         "hint": "只有开始时间在此窗口内的新活动才会推送，避免把几个月后的活动提前刷出来。设为 0 表示不限制。"
       },
+      "new_activity_timing": {
+        "description": "新活动通知时机",
+        "type": "string",
+        "default": "preview",
+        "options": [
+          "preview",
+          "on_start"
+        ],
+        "hint": "preview = 可预告通知：活动进入「提前预告窗口」就推，哪怕还没开始；on_start = 开启当天通知：等活动真正开启后再推，未开始的不算新活动（订阅时还没开始的活动也会等它开启后再补推一次）。"
+      },
       "notify_on_subscribe": {
         "description": "订阅成功后立即推送一次当前活动概览",
         "type": "bool",

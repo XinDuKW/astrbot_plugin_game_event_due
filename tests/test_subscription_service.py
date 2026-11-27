@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from astrbot_plugin_game_event_due.services.reminder_service import (
+    NEW_ACTIVITY_ON_START,
     ActivityNotifyState,
     ReminderPolicy,
 )
@@ -35,6 +36,7 @@ def make_service() -> tuple[SubscriptionService, FakeKV]:
 def make_activity(
     activity_id: str = "a1",
     *,
+    start: timedelta = timedelta(days=-1),
     end: timedelta = timedelta(days=5),
     name: str = "活动",
 ) -> Activity:
@@ -42,7 +44,7 @@ def make_activity(
         game_id="sr",
         activity_id=activity_id,
         name=name,
-        start_time=NOW - timedelta(days=1),
+        start_time=NOW + start,
         end_time=NOW + end,
     )
 
@@ -188,6 +190,35 @@ def test_build_initial_states_marks_new_and_current_tier():
 
     # 已结束的活动不写入状态
     assert "sr|a3" not in states
+
+
+def test_build_initial_states_preview_marks_unstarted_as_known():
+    # 「可预告通知」：订阅时还没开始的活动也算已经预告过，不会开服再补一次
+    states = SubscriptionService.build_initial_states(
+        [make_activity("a1", start=timedelta(days=3), end=timedelta(days=20))],
+        NOW,
+        POLICY,
+    )
+    assert states["sr|a1"]["new"] is True
+
+
+def test_build_initial_states_on_start_keeps_unstarted_pending():
+    # 「开启当天通知」：订阅时还没开始的活动不能吞掉，等活动开了再推一次
+    policy = ReminderPolicy(thresholds=(7, 3, 1), notify_new=True, lookahead_days=45,
+                            new_activity_timing=NEW_ACTIVITY_ON_START)
+    states = SubscriptionService.build_initial_states(
+        [
+            make_activity("a1", start=timedelta(days=3), end=timedelta(days=20)),
+            make_activity("a2", start=timedelta(days=-1), end=timedelta(days=2)),
+        ],
+        NOW,
+        policy,
+    )
+    # 只有 new=True 才会写进 KV，所以这里断言「没有 new 标记」
+    assert "new" not in states["sr|a1"]
+    assert "tier" not in states["sr|a1"]
+    assert states["sr|a2"]["new"] is True
+    assert states["sr|a2"]["tier"] == "d3"
 
 
 def test_build_initial_states_with_countdown_disabled():

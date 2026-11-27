@@ -4,7 +4,9 @@
 
 提醒分为两类：
 
-* **新活动**：某个活动第一次出现在本会话的视野中时推送一次。
+* **新活动**：某个活动第一次出现在本会话的视野中时推送一次。推送时机由
+  ``new_activity_timing`` 决定：``preview``（默认）进入预告窗口就推，
+  ``on_start`` 等它真正开启后再推。
 * **倒计时**：活动结束前剩余时间进入某个档位时推送一次。档位按天数
   从大到小配置（默认 ``7, 3, 1``），1 表示剩余不足 24 小时。
 
@@ -23,7 +25,40 @@ from ..sources.base import Activity
 
 REASON_NEW = "new"
 
+# 「新活动」的推送时机：
+# * preview：活动一进入预告窗口就推（默认，能提前知道要开什么）；
+# * on_start：等活动真正开启之后再推，避免「还没开就叫新活动」。
+NEW_ACTIVITY_PREVIEW = "preview"
+NEW_ACTIVITY_ON_START = "on_start"
+NEW_ACTIVITY_TIMINGS: tuple[str, ...] = (NEW_ACTIVITY_PREVIEW, NEW_ACTIVITY_ON_START)
+_TIMING_ALIASES = {
+    "": NEW_ACTIVITY_PREVIEW,
+    "preview": NEW_ACTIVITY_PREVIEW,
+    "预告": NEW_ACTIVITY_PREVIEW,
+    "提前": NEW_ACTIVITY_PREVIEW,
+    "提前预告": NEW_ACTIVITY_PREVIEW,
+    "preview_notice": NEW_ACTIVITY_PREVIEW,
+    "on_start": NEW_ACTIVITY_ON_START,
+    "onstart": NEW_ACTIVITY_ON_START,
+    "start": NEW_ACTIVITY_ON_START,
+    "started": NEW_ACTIVITY_ON_START,
+    "开启": NEW_ACTIVITY_ON_START,
+    "当天": NEW_ACTIVITY_ON_START,
+    "开启当天": NEW_ACTIVITY_ON_START,
+    "开始后": NEW_ACTIVITY_ON_START,
+}
+
 DEFAULT_THRESHOLDS: tuple[int, ...] = (7, 3, 1)
+
+
+def normalize_new_activity_timing(value: Any) -> str:
+    """把配置值归一化成 ``preview`` / ``on_start``。
+
+    认不出来（含拼错、大小写混写、旧配置缺失）时退回 ``preview``，保持
+    「进入预告窗口就推」的老行为，升级不会突然少推送。
+    """
+    key = str(value or "").strip().casefold().replace("-", "_").replace(" ", "")
+    return _TIMING_ALIASES.get(key, NEW_ACTIVITY_PREVIEW)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +68,7 @@ class ReminderPolicy:
     thresholds: tuple[int, ...] = DEFAULT_THRESHOLDS
     notify_new: bool = True
     lookahead_days: int = 45
+    new_activity_timing: str = NEW_ACTIVITY_PREVIEW
     remind_only_active: bool = True
 
     @property
@@ -174,11 +210,20 @@ def within_lookahead(
     activity: Activity,
     now: datetime,
     lookahead_days: int,
+    *,
+    on_start: bool = False,
 ) -> bool:
-    """新活动是否已经进入预告窗口。"""
-    if lookahead_days <= 0:
-        return True
+    """新活动是否已经进入可推送的范围。
+
+    ``on_start`` 为真时只认「活动已经开启」，不看预告窗口；这时必须
+    ``start_time <= now`` 才算可推。活动没有开始时间（多数是常驻玩法）时
+    两种情况都直接放行。
+    """
     if activity.start_time is None:
+        return True
+    if on_start:
+        return activity.start_time <= now
+    if lookahead_days <= 0:
         return True
     return activity.start_time <= now + timedelta(days=lookahead_days)
 
@@ -206,7 +251,14 @@ def evaluate_activity(
     tier = ""
 
     if policy.notify_new and not state.new_done:
-        if within_lookahead(activity, now, policy.lookahead_days):
+        if within_lookahead(
+            activity,
+            now,
+            policy.lookahead_days,
+            on_start=(
+                policy.new_activity_timing == NEW_ACTIVITY_ON_START
+            ),
+        ):
             reasons.append(REASON_NEW)
 
     if policy.countdown_enabled:
